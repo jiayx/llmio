@@ -1,0 +1,57 @@
+{
+  "listen": ":8080",
+  "api_keys": ["${LLMIO_API_KEY}"],
+  "providers": [
+    {
+      "name": "moonshot",
+      "type": "openai-compatible",
+      "base_url": "https://api.moonshot.ai/v1",
+      "api_key": "${MOONSHOT_API_KEY}",
+      "supported_api_types": ["chat_completions"]
+    },
+    {
+      "name": "deepseek",
+      "type": "openai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "${DEEPSEEK_API_KEY}"
+    },
+    {
+      "name": "anthropic",
+      "type": "anthropic-native",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key": "${ANTHROPIC_API_KEY}"
+    }
+  ],
+  "model_routes": [
+    {
+      "external_model": "gpt-4o-proxy",
+      "targets": [
+        {
+          "provider": "moonshot",
+          "backend_model": "moonshot-v1-8k"
+        },
+        {
+          "provider": "deepseek",
+          "backend_model": "deepseek-chat"
+        }
+      ]
+    },
+    {
+      "external_model": "claude-3-5-sonnet-proxy",
+      "targets": [
+        {
+          "provider": "anthropic",
+          "backend_model": "claude-3-5-sonnet-20241022"
+        },
+        {
+          "provider": "deepseek",
+          "backend_model": "deepseek-chat"
+        },
+        {
+          "provider": "moonshot",
+          "backend_model": "moonshot-v1-8k"
+        }
+      ]
+    }
+  ]
+}

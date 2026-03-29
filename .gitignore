@@ -1,0 +1,5 @@
+.agents
+.cache
+
+.env
+llmio.json
