@@ -1,4 +1,4 @@
-package providers
+package anthropic
 
 import (
 	"bufio"
@@ -10,14 +10,16 @@ import (
 	"strings"
 
 	"github.com/jiayx/llmio/internal/config"
-	"github.com/jiayx/llmio/internal/core"
-	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
+	"github.com/jiayx/llmio/internal/llm"
+	providerapi "github.com/jiayx/llmio/internal/providers/api"
+	providershared "github.com/jiayx/llmio/internal/providers/shared"
+	anthropicproto "github.com/jiayx/llmio/internal/wire/anthropic"
 )
 
 // AnthropicNative implements a normalized provider backed by Anthropic's native API.
 type AnthropicNative struct {
 	name       string
-	httpClient *providerHTTPClient
+	httpClient *providershared.HTTPClient
 	supported  map[string]struct{}
 }
 
@@ -25,13 +27,13 @@ type AnthropicNative struct {
 func NewAnthropicNative(cfg config.ProviderConfig) *AnthropicNative {
 	return &AnthropicNative{
 		name: cfg.Name,
-		httpClient: newProviderHTTPClient(cfg.BaseURL, cfg.Headers, nil, func(req *http.Request) {
+		httpClient: providershared.NewHTTPClient(cfg.BaseURL, cfg.Headers, nil, func(req *http.Request) {
 			if cfg.APIKey != "" {
 				req.Header.Set("x-api-key", cfg.APIKey)
 			}
 			req.Header.Set("anthropic-version", "2023-06-01")
 		}),
-		supported: newAPISupportSet(cfg.SupportedAPITypes),
+		supported: providershared.NewAPISupportSet(cfg.SupportedAPITypes),
 	}
 }
 
@@ -42,7 +44,12 @@ func (p *AnthropicNative) Name() string {
 
 // SupportsAnthropicAPI reports whether a native Anthropic API type should use passthrough.
 func (p *AnthropicNative) SupportsAnthropicAPI(apiType string) bool {
-	return supportsAPIType(p.supported, apiType)
+	return providershared.SupportsAPIType(p.supported, apiType)
+}
+
+// SupportsPassthrough reports whether this adapter can natively forward the given request shape.
+func (p *AnthropicNative) SupportsPassthrough(protocol, apiType string) bool {
+	return protocol == "anthropic" && p.SupportsAnthropicAPI(apiType)
 }
 
 // ForwardAnthropic forwards a native Anthropic request without normalization.
@@ -50,9 +57,17 @@ func (p *AnthropicNative) ForwardAnthropic(ctx context.Context, path string, bod
 	return p.httpClient.Do(ctx, http.MethodPost, path, body, headers)
 }
 
+// Forward forwards a native request using the adapter's protocol-aware passthrough path.
+func (p *AnthropicNative) Forward(ctx context.Context, protocol, path string, body []byte, headers http.Header) (*http.Response, error) {
+	if protocol != "anthropic" {
+		return nil, fmt.Errorf("provider %s does not support %s passthrough", p.name, protocol)
+	}
+	return p.ForwardAnthropic(ctx, path, body, headers)
+}
+
 // Chat executes a normalized non-streaming chat request.
-func (p *AnthropicNative) Chat(ctx context.Context, req core.ChatRequest) (*core.ChatResponse, error) {
-	payload, err := json.Marshal(coreToAnthropic(req))
+func (p *AnthropicNative) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	payload, err := json.Marshal(llmToAnthropic(req))
 	if err != nil {
 		return nil, fmt.Errorf("marshal anthropic request: %w", err)
 	}
@@ -61,7 +76,7 @@ func (p *AnthropicNative) Chat(ctx context.Context, req core.ChatRequest) (*core
 	if err != nil {
 		return nil, err
 	}
-	defer closeResponseBody("anthropic chat", resp.Body)
+	defer providershared.CloseResponseBody("anthropic chat", resp.Body)
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -76,12 +91,12 @@ func (p *AnthropicNative) Chat(ctx context.Context, req core.ChatRequest) (*core
 		return nil, fmt.Errorf("decode provider response: %w", err)
 	}
 
-	return anthropicToCoreResponse(out, data), nil
+	return anthropicToLLMResponse(out, data), nil
 }
 
 // ChatStream executes a normalized streaming chat request.
-func (p *AnthropicNative) ChatStream(ctx context.Context, req core.ChatRequest) (*StreamReader, error) {
-	payload := coreToAnthropic(req)
+func (p *AnthropicNative) ChatStream(ctx context.Context, req llm.ChatRequest) (*providerapi.StreamReader, error) {
+	payload := llmToAnthropic(req)
 	payload.Stream = true
 
 	body, err := json.Marshal(payload)
@@ -94,7 +109,7 @@ func (p *AnthropicNative) ChatStream(ctx context.Context, req core.ChatRequest) 
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		defer closeResponseBody("anthropic chat stream error", resp.Body)
+		defer providershared.CloseResponseBody("anthropic chat stream error", resp.Body)
 		data, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
 			return nil, fmt.Errorf("provider %s returned status %d", p.name, resp.StatusCode)
@@ -102,13 +117,13 @@ func (p *AnthropicNative) ChatStream(ctx context.Context, req core.ChatRequest) 
 		return nil, fmt.Errorf("provider %s returned status %d: %s", p.name, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
-	events := make(chan core.StreamEvent, 16)
+	events := make(chan llm.StreamEvent, 16)
 	errs := make(chan error, 1)
 
 	go func() {
 		defer close(events)
 		defer close(errs)
-		defer closeResponseBody("anthropic chat stream", resp.Body)
+		defer providershared.CloseResponseBody("anthropic chat stream", resp.Body)
 
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -130,7 +145,7 @@ func (p *AnthropicNative) ChatStream(ctx context.Context, req core.ChatRequest) 
 			}
 
 			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if err := anthropicSSEToCoreEvents(eventName, payload, blockState, events); err != nil {
+			if err := anthropicSSEToLLMEvents(eventName, payload, blockState, events); err != nil {
 				errs <- err
 				return
 			}
@@ -144,7 +159,7 @@ func (p *AnthropicNative) ChatStream(ctx context.Context, req core.ChatRequest) 
 		}
 	}()
 
-	return &StreamReader{
+	return &providerapi.StreamReader{
 		Events: events,
 		Err:    errs,
 		Close:  resp.Body.Close,

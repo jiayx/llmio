@@ -2,38 +2,37 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	clientmeta "github.com/jiayx/llmio/internal/clients"
+	anthropicclient "github.com/jiayx/llmio/internal/clients/anthropic"
+	openaiclient "github.com/jiayx/llmio/internal/clients/openai"
 	"github.com/jiayx/llmio/internal/config"
-	"github.com/jiayx/llmio/internal/core"
-	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
-	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
+	"github.com/jiayx/llmio/internal/llm"
+	"github.com/jiayx/llmio/internal/policy"
 	"github.com/jiayx/llmio/internal/providers"
+	providerapi "github.com/jiayx/llmio/internal/providers/api"
+	"github.com/jiayx/llmio/internal/routing"
+	transporthttp "github.com/jiayx/llmio/internal/transport/http"
 )
 
-type chatProvider = providers.ChatProvider
-
-type routeTarget struct {
-	ProviderName string
-	BackendModel string
-}
-
-type modelRoute struct {
-	Targets []routeTarget
-}
+type chatProvider = providerapi.ProviderAdapter
+type routeTarget = routing.Target
+type modelRoute = routing.Route
 
 // Server routes compatible OpenAI and Anthropic requests to configured providers.
 type Server struct {
 	apiKeys   map[string]struct{}
 	providers map[string]chatProvider
 	models    map[string]modelRoute
+	router    *routing.Router
+	policy    *policy.Policy
 }
 
 // NewServer constructs a gateway server from config.
@@ -51,28 +50,26 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	}
 
 	for _, p := range cfg.Providers {
-		switch p.Type {
-		case "openai-compatible":
-			s.providers[p.Name] = providers.NewOpenAICompatible(p)
-		case "anthropic-native":
-			s.providers[p.Name] = providers.NewAnthropicNative(p)
-		default:
-			return nil, fmt.Errorf("unsupported provider type %q", p.Type)
+		adapter, err := providers.NewAdapter(p)
+		if err != nil {
+			return nil, err
 		}
+		s.providers[p.Name] = adapter
 	}
 
+	router, err := routing.New(cfg, s.providers)
+	if err != nil {
+		return nil, err
+	}
+	s.router = router
+	s.policy = policy.New(policy.DefaultConfig(), s.providers)
+
 	for _, route := range cfg.ModelRoutes {
-		targets := make([]routeTarget, 0, len(route.Targets))
-		for _, target := range route.Targets {
-			if _, ok := s.providers[target.Provider]; !ok {
-				return nil, fmt.Errorf("model route %q references unknown provider %q", route.ExternalModel, target.Provider)
-			}
-			targets = append(targets, routeTarget{
-				ProviderName: target.Provider,
-				BackendModel: target.BackendModel,
-			})
+		resolved, ok := router.Resolve(route.ExternalModel)
+		if !ok {
+			return nil, fmt.Errorf("model route %q not found after router build", route.ExternalModel)
 		}
-		s.models[route.ExternalModel] = modelRoute{Targets: targets}
+		s.models[route.ExternalModel] = resolved
 	}
 
 	return s, nil
@@ -89,7 +86,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/responses", s.handleOpenAIResponses)
 	mux.HandleFunc("/responses", s.handleOpenAIResponses)
 	mux.HandleFunc("/anthropic/v1/messages", s.handleAnthropicMessages)
-	mux.HandleFunc("/messages", s.handleAnthropicMessages)
 	return s.withLogging(s.withAuth(mux))
 }
 
@@ -100,15 +96,15 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		key := bearerToken(r.Header.Get("Authorization"))
+		key := transporthttp.BearerToken(r.Header.Get("Authorization"))
 		if key == "" {
 			key = strings.TrimSpace(r.Header.Get("x-api-key"))
 		}
 		if _, ok := s.apiKeys[key]; !ok {
-			if strings.HasPrefix(r.URL.Path, "/anthropic/") {
-				writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "unauthorized")
+			if clientmeta.ProtocolForPath(r.URL.Path) == clientmeta.ProtocolAnthropic {
+				anthropicclient.WriteError(w, http.StatusUnauthorized, "authentication_error", "unauthorized")
 			} else {
-				writeOpenAIError(w, http.StatusUnauthorized, "unauthorized")
+				openaiclient.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			}
 			return
 		}
@@ -120,12 +116,12 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 func (s *Server) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		ww := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		ww := &transporthttp.StatusRecorder{ResponseWriter: w, Status: http.StatusOK}
 		next.ServeHTTP(ww, r)
 		slog.Info("request completed",
 			"method", r.Method,
 			"path", r.URL.Path,
-			"status", ww.status,
+			"status", ww.Status,
 			"duration", time.Since(start).Truncate(time.Millisecond),
 			"remote", r.RemoteAddr,
 		)
@@ -133,44 +129,39 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	transporthttp.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
-	models := make([]openaiproto.ModelInfo, 0, len(s.models))
-	for external, route := range s.models {
-		owner := ""
-		if len(route.Targets) > 0 {
-			owner = route.Targets[0].ProviderName
-		}
-		models = append(models, openaiproto.ModelInfo{
-			ID:      external,
-			Object:  "model",
-			OwnedBy: owner,
-		})
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if !allowsMethod(r.Method, http.MethodGet, http.MethodHead) {
+		writeMethodNotAllowed(w, "openai", http.MethodGet)
+		return
 	}
-	writeJSON(w, http.StatusOK, openaiproto.ModelsResponse{
-		Object: "list",
-		Data:   models,
-	})
+
+	openaiclient.WriteModels(w, s.modelInfos())
 }
 
 func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, "openai", http.MethodPost)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("read request: %v", err))
+		openaiclient.WriteError(w, http.StatusBadRequest, fmt.Sprintf("read request: %v", err))
 		return
 	}
 
-	var req openaiproto.ChatCompletionRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+	req, err := openaiclient.DecodeChatCompletionRequest(body)
+	if err != nil {
+		openaiclient.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	route, ok := s.models[req.Model]
+	route, ok := s.resolveRoute(req.Model)
 	if !ok {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("unknown model %q", req.Model))
+		openaiclient.WriteError(w, http.StatusBadRequest, fmt.Sprintf("unknown model %q", req.Model))
 		return
 	}
 	slog.Debug("gateway request decoded",
@@ -181,16 +172,21 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		"route_targets", routeTargetsForLog(route),
 	)
 
-	if resp, handled, err := s.tryOpenAIPassthrough(r.Context(), route, providers.OpenAIAPIChatCompletions, "/chat/completions", body, r.Header); handled {
+	meta := openaiclient.NewChatCompletionRequestMeta(req, body, r.Header)
+	if resp, handled, err := s.tryPassthrough(r.Context(), route, meta); handled {
 		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, err.Error())
+			openaiclient.WriteError(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		writePassthroughResponse(w, resp, "openai", req.Model)
+		openaiclient.WritePassthroughResponse(w, resp, req.Model)
 		return
 	}
 
-	chatReq := openAIRequestToCore(req)
+	chatReq, err := openaiclient.ChatCompletionRequestToLLM(req)
+	if err != nil {
+		openaiclient.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if req.Stream {
 		s.handleOpenAIStream(w, r, route, chatReq)
 		return
@@ -198,29 +194,34 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 
 	resp, err := s.dispatchChat(r.Context(), route, chatReq)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		openaiclient.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	writeCoreResponseAsOpenAI(w, req.Model, resp)
+	openaiclient.WriteChatCompletionResponse(w, req.Model, resp)
 }
 
 func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, "openai", http.MethodPost)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("read request: %v", err))
+		openaiclient.WriteError(w, http.StatusBadRequest, fmt.Sprintf("read request: %v", err))
 		return
 	}
 
-	var req openaiproto.ResponsesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("invalid json: %v", err))
+	req, err := openaiclient.DecodeResponsesRequest(body)
+	if err != nil {
+		openaiclient.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	route, ok := s.models[req.Model]
+	route, ok := s.resolveRoute(req.Model)
 	if !ok {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("unknown model %q", req.Model))
+		openaiclient.WriteError(w, http.StatusBadRequest, fmt.Sprintf("unknown model %q", req.Model))
 		return
 	}
 	slog.Debug("gateway request decoded",
@@ -231,18 +232,19 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		"route_targets", routeTargetsForLog(route),
 	)
 
-	if resp, handled, err := s.tryOpenAIPassthrough(r.Context(), route, providers.OpenAIAPIResponses, "/responses", body, r.Header); handled {
+	meta := openaiclient.NewResponsesRequestMeta(req, body, r.Header)
+	if resp, handled, err := s.tryPassthrough(r.Context(), route, meta); handled {
 		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, err.Error())
+			openaiclient.WriteError(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		writePassthroughResponse(w, resp, "openai", req.Model)
+		openaiclient.WritePassthroughResponse(w, resp, req.Model)
 		return
 	}
 
-	chatReq, err := openAIResponsesRequestToCore(req)
+	chatReq, err := openaiclient.ResponsesRequestToLLM(req)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		openaiclient.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -253,29 +255,34 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.dispatchChat(r.Context(), route, chatReq)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		openaiclient.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, coreResponseToOpenAIResponse(req.Model, resp))
+	openaiclient.WriteResponsesResponse(w, req.Model, resp)
 }
 
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, "anthropic", http.MethodPost)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("read request: %v", err))
+		anthropicclient.WriteError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("read request: %v", err))
 		return
 	}
 
-	var req anthropicproto.MessagesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("invalid json: %v", err))
+	req, err := anthropicclient.DecodeMessagesRequest(body)
+	if err != nil {
+		anthropicclient.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
-	route, ok := s.models[req.Model]
+	route, ok := s.resolveRoute(req.Model)
 	if !ok {
-		writeAnthropicError(w, http.StatusBadRequest, "not_found_error", fmt.Sprintf("unknown model %q", req.Model))
+		anthropicclient.WriteError(w, http.StatusBadRequest, "not_found_error", fmt.Sprintf("unknown model %q", req.Model))
 		return
 	}
 	slog.Debug("gateway request decoded",
@@ -286,18 +293,19 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		"route_targets", routeTargetsForLog(route),
 	)
 
-	if resp, handled, err := s.tryAnthropicPassthrough(r.Context(), route, providers.AnthropicAPIMessages, "/messages", body, r.Header); handled {
+	meta := anthropicclient.NewMessagesRequestMeta(req, body, r.Header)
+	if resp, handled, err := s.tryPassthrough(r.Context(), route, meta); handled {
 		if err != nil {
-			writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+			anthropicclient.WriteError(w, http.StatusBadGateway, "api_error", err.Error())
 			return
 		}
-		writePassthroughResponse(w, resp, "anthropic", req.Model)
+		anthropicclient.WritePassthroughResponse(w, resp, req.Model)
 		return
 	}
 
-	chatReq, err := anthropicToCore(req)
+	chatReq, err := anthropicclient.MessagesRequestToLLM(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		anthropicclient.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
@@ -308,217 +316,85 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	resp, err := s.dispatchChat(r.Context(), route, chatReq)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+		anthropicclient.WriteError(w, http.StatusBadGateway, "api_error", err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, coreResponseToAnthropic(req.Model, resp))
+	anthropicclient.WriteMessagesResponse(w, req.Model, resp)
 }
 
-func (s *Server) dispatchChat(ctx context.Context, route modelRoute, req core.ChatRequest) (*core.ChatResponse, error) {
-	var lastErr error
-	for _, target := range route.Targets {
-		providerReq := req
-		providerReq.Model = target.BackendModel
-		slog.Debug("dispatch chat attempt",
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-			"stream", false,
-		)
-		resp, err := s.providers[target.ProviderName].Chat(ctx, providerReq)
-		if err == nil {
-			slog.Debug("dispatch chat success",
-				"provider", target.ProviderName,
-				"backend_model", target.BackendModel,
-			)
-			return resp, nil
-		}
-		slog.Debug("dispatch chat failed",
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-			"err", err,
-		)
-		lastErr = fmt.Errorf("provider %s: %w", target.ProviderName, err)
-		if !retryableError(err) {
-			return nil, lastErr
-		}
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no provider available")
-	}
-	return nil, lastErr
+func (s *Server) dispatchChat(ctx context.Context, route modelRoute, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	return s.executionPolicy().ExecuteChat(ctx, route, req)
 }
 
-func (s *Server) dispatchChatStream(ctx context.Context, route modelRoute, req core.ChatRequest) (*providers.StreamReader, error) {
-	var lastErr error
-	for _, target := range route.Targets {
-		providerReq := req
-		providerReq.Model = target.BackendModel
-		slog.Debug("dispatch chat attempt",
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-			"stream", true,
-		)
-		stream, err := s.providers[target.ProviderName].ChatStream(ctx, providerReq)
-		if err == nil {
-			slog.Debug("dispatch chat success",
-				"provider", target.ProviderName,
-				"backend_model", target.BackendModel,
-				"stream", true,
-			)
-			return stream, nil
-		}
-		slog.Debug("dispatch chat failed",
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-			"stream", true,
-			"err", err,
-		)
-		lastErr = fmt.Errorf("provider %s: %w", target.ProviderName, err)
-		if !retryableError(err) {
-			return nil, lastErr
-		}
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no provider available")
-	}
-	return nil, lastErr
+func (s *Server) dispatchChatStream(ctx context.Context, route modelRoute, req llm.ChatRequest) (*providerapi.StreamReader, error) {
+	return s.executionPolicy().ExecuteStream(ctx, route, req)
 }
 
-func (s *Server) tryOpenAIPassthrough(ctx context.Context, route modelRoute, apiType, path string, body []byte, headers http.Header) (*http.Response, bool, error) {
-	for _, target := range route.Targets {
-		provider := s.providers[target.ProviderName]
-		forwarder, ok := provider.(providers.OpenAIPassthroughProvider)
-		if !ok {
-			continue
-		}
-		if supporter, ok := provider.(providers.OpenAPITypeSupporter); ok && !supporter.SupportsOpenAIAPI(apiType) {
-			slog.Debug("passthrough skipped",
-				"protocol", "openai",
-				"api_type", apiType,
-				"path", path,
-				"provider", target.ProviderName,
-				"backend_model", target.BackendModel,
-			)
-			continue
-		}
-		slog.Debug("passthrough attempt",
-			"protocol", "openai",
-			"api_type", apiType,
-			"path", path,
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-		)
-		payload, err := rewriteRequestModel(body, target.BackendModel)
-		if err != nil {
-			return nil, true, err
-		}
-		resp, err := forwarder.ForwardOpenAI(ctx, path, payload, headers)
-		if err != nil {
-			if retryableError(err) {
-				slog.Debug("passthrough retryable failure",
-					"protocol", "openai",
-					"api_type", apiType,
-					"path", path,
-					"provider", target.ProviderName,
-					"backend_model", target.BackendModel,
-					"err", err,
-				)
-				continue
-			}
-			return nil, true, fmt.Errorf("provider %s: %w", target.ProviderName, err)
-		}
-		if retryableStatus(resp.StatusCode) {
-			slog.Debug("passthrough retryable status",
-				"protocol", "openai",
-				"api_type", apiType,
-				"path", path,
-				"provider", target.ProviderName,
-				"backend_model", target.BackendModel,
-				"status", resp.StatusCode,
-			)
-			closeResponseBody("openai passthrough retry", resp.Body)
-			continue
-		}
-		slog.Debug("passthrough success",
-			"protocol", "openai",
-			"api_type", apiType,
-			"path", path,
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-			"status", resp.StatusCode,
-		)
-		return resp, true, nil
-	}
-	return nil, false, nil
+func (s *Server) tryPassthrough(ctx context.Context, route modelRoute, meta clientmeta.RequestMeta) (*http.Response, bool, error) {
+	return s.executionPolicy().ExecutePassthrough(ctx, route, meta)
 }
 
-func (s *Server) tryAnthropicPassthrough(ctx context.Context, route modelRoute, apiType, path string, body []byte, headers http.Header) (*http.Response, bool, error) {
-	for _, target := range route.Targets {
-		provider := s.providers[target.ProviderName]
-		forwarder, ok := provider.(providers.AnthropicPassthroughProvider)
-		if !ok {
-			continue
-		}
-		if supporter, ok := provider.(providers.AnthropicAPITypeSupporter); ok && !supporter.SupportsAnthropicAPI(apiType) {
-			slog.Debug("passthrough skipped",
-				"protocol", "anthropic",
-				"api_type", apiType,
-				"path", path,
-				"provider", target.ProviderName,
-				"backend_model", target.BackendModel,
-			)
-			continue
-		}
-		slog.Debug("passthrough attempt",
-			"protocol", "anthropic",
-			"api_type", apiType,
-			"path", path,
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-		)
-		payload, err := rewriteRequestModel(body, target.BackendModel)
-		if err != nil {
-			return nil, true, err
-		}
-		resp, err := forwarder.ForwardAnthropic(ctx, path, payload, headers)
-		if err != nil {
-			if retryableError(err) {
-				slog.Debug("passthrough retryable failure",
-					"protocol", "anthropic",
-					"api_type", apiType,
-					"path", path,
-					"provider", target.ProviderName,
-					"backend_model", target.BackendModel,
-					"err", err,
-				)
-				continue
-			}
-			return nil, true, fmt.Errorf("provider %s: %w", target.ProviderName, err)
-		}
-		if retryableStatus(resp.StatusCode) {
-			slog.Debug("passthrough retryable status",
-				"protocol", "anthropic",
-				"api_type", apiType,
-				"path", path,
-				"provider", target.ProviderName,
-				"backend_model", target.BackendModel,
-				"status", resp.StatusCode,
-			)
-			closeResponseBody("anthropic passthrough retry", resp.Body)
-			continue
-		}
-		slog.Debug("passthrough success",
-			"protocol", "anthropic",
-			"api_type", apiType,
-			"path", path,
-			"provider", target.ProviderName,
-			"backend_model", target.BackendModel,
-			"status", resp.StatusCode,
-		)
-		return resp, true, nil
+func writeMethodNotAllowed(w http.ResponseWriter, protocol, allow string) {
+	w.Header().Set("Allow", allow)
+	message := fmt.Sprintf("method not allowed: use %s", allow)
+	if protocol == "anthropic" {
+		anthropicclient.WriteError(w, http.StatusMethodNotAllowed, "invalid_request_error", message)
+		return
 	}
-	return nil, false, nil
+	openaiclient.WriteError(w, http.StatusMethodNotAllowed, message)
+}
+
+func allowsMethod(method string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if method == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) executionPolicy() *policy.Policy {
+	if s.policy == nil {
+		s.policy = policy.New(policy.DefaultConfig(), s.providers)
+	}
+	return s.policy
+}
+
+func (s *Server) resolveRoute(externalModel string) (modelRoute, bool) {
+	if s.router != nil {
+		if route, ok := s.router.Resolve(externalModel); ok {
+			return route, true
+		}
+	}
+	route, ok := s.models[externalModel]
+	return route, ok
+}
+
+func (s *Server) modelInfos() []routing.ModelInfo {
+	if s.router != nil {
+		return s.router.ModelInfos()
+	}
+
+	keys := make([]string, 0, len(s.models))
+	for external := range s.models {
+		keys = append(keys, external)
+	}
+	slices.Sort(keys)
+
+	out := make([]routing.ModelInfo, 0, len(keys))
+	for _, external := range keys {
+		route := s.models[external]
+		owner := ""
+		if len(route.Targets) > 0 {
+			owner = route.Targets[0].ProviderName
+		}
+		out = append(out, routing.ModelInfo{
+			ID:      external,
+			OwnedBy: owner,
+		})
+	}
+	return out
 }
 
 func routeTargetsForLog(route modelRoute) []string {
@@ -530,4 +406,31 @@ func routeTargetsForLog(route modelRoute) []string {
 		out = append(out, target.ProviderName+":"+target.BackendModel)
 	}
 	return out
+}
+
+func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, route modelRoute, req llm.ChatRequest) {
+	stream, err := s.dispatchChatStream(r.Context(), route, req)
+	if err != nil {
+		openaiclient.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	openaiclient.ServeChatCompletionStream(w, r, req.Model, stream)
+}
+
+func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, externalModel string, route modelRoute, req llm.ChatRequest) {
+	stream, err := s.dispatchChatStream(r.Context(), route, req)
+	if err != nil {
+		openaiclient.WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	openaiclient.ServeResponsesStream(w, r, externalModel, stream)
+}
+
+func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, externalModel string, route modelRoute, req llm.ChatRequest) {
+	stream, err := s.dispatchChatStream(r.Context(), route, req)
+	if err != nil {
+		anthropicclient.WriteError(w, http.StatusBadGateway, "api_error", err.Error())
+		return
+	}
+	anthropicclient.ServeMessagesStream(w, r, externalModel, stream)
 }

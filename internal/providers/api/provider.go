@@ -1,18 +1,21 @@
-package providers
+package providerapi
 
 import (
 	"context"
 	"net/http"
 
-	"github.com/jiayx/llmio/internal/core"
+	"github.com/jiayx/llmio/internal/llm"
 )
 
 // ChatProvider handles normalized chat requests for a backend model provider.
 type ChatProvider interface {
 	Name() string
-	Chat(ctx context.Context, req core.ChatRequest) (*core.ChatResponse, error)
-	ChatStream(ctx context.Context, req core.ChatRequest) (*StreamReader, error)
+	Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
+	ChatStream(ctx context.Context, req llm.ChatRequest) (*StreamReader, error)
 }
+
+// ProviderAdapter is the backend-facing adapter contract used by the gateway.
+type ProviderAdapter = ChatProvider
 
 // OpenAIPassthroughProvider forwards native OpenAI-compatible requests.
 type OpenAIPassthroughProvider interface {
@@ -22,6 +25,16 @@ type OpenAIPassthroughProvider interface {
 // AnthropicPassthroughProvider forwards native Anthropic-compatible requests.
 type AnthropicPassthroughProvider interface {
 	ForwardAnthropic(ctx context.Context, path string, body []byte, headers http.Header) (*http.Response, error)
+}
+
+// PassthroughSupporter reports whether a provider can natively forward a request without normalization.
+type PassthroughSupporter interface {
+	SupportsPassthrough(protocol, apiType string) bool
+}
+
+// PassthroughForwarder forwards a native request using protocol-aware dispatch.
+type PassthroughForwarder interface {
+	Forward(ctx context.Context, protocol, path string, body []byte, headers http.Header) (*http.Response, error)
 }
 
 const (
@@ -43,7 +56,7 @@ type AnthropicAPITypeSupporter interface {
 
 // StreamReader exposes a normalized provider event stream and its lifecycle hooks.
 type StreamReader struct {
-	Events <-chan core.StreamEvent
+	Events <-chan llm.StreamEvent
 	Err    <-chan error
 	Close  func() error
 }

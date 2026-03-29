@@ -67,15 +67,28 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config.model_routes is required")
 	}
 
+	providerNames := make(map[string]struct{}, len(cfg.Providers))
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
+		p.Name = strings.TrimSpace(p.Name)
+		if p.Name == "" {
+			return nil, fmt.Errorf("config.providers[%d].name is required", i)
+		}
+		if _, exists := providerNames[p.Name]; exists {
+			return nil, fmt.Errorf("duplicate provider %q", p.Name)
+		}
+		providerNames[p.Name] = struct{}{}
+		p.Type = strings.ToLower(strings.TrimSpace(p.Type))
 		if p.Type == "" {
 			p.Type = "openai-compatible"
+		}
+		p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+		if p.BaseURL == "" {
+			return nil, fmt.Errorf("provider %q base_url is required", p.Name)
 		}
 		if p.ModelsPath == "" {
 			p.ModelsPath = "/models"
 		}
-		p.BaseURL = strings.TrimRight(p.BaseURL, "/")
 		apiTypes := make([]string, 0, len(p.SupportedAPITypes))
 		for _, apiType := range p.SupportedAPITypes {
 			apiType = strings.ToLower(strings.TrimSpace(apiType))
@@ -93,7 +106,13 @@ func Load(path string) (*Config, error) {
 
 	for i := range cfg.ModelRoutes {
 		route := &cfg.ModelRoutes[i]
+		route.ExternalModel = strings.TrimSpace(route.ExternalModel)
+		if route.ExternalModel == "" {
+			return nil, fmt.Errorf("config.model_routes[%d].external_model is required", i)
+		}
 		if len(route.Targets) == 0 {
+			route.Provider = strings.TrimSpace(route.Provider)
+			route.BackendModel = strings.TrimSpace(route.BackendModel)
 			if route.Provider == "" || route.BackendModel == "" {
 				return nil, fmt.Errorf("model route %q requires provider/backend_model or targets", route.ExternalModel)
 			}
@@ -102,6 +121,25 @@ func Load(path string) (*Config, error) {
 				BackendModel: route.BackendModel,
 			}}
 		}
+		for j := range route.Targets {
+			target := &route.Targets[j]
+			target.Provider = strings.TrimSpace(target.Provider)
+			target.BackendModel = strings.TrimSpace(target.BackendModel)
+			if target.Provider == "" {
+				return nil, fmt.Errorf("model route %q target[%d] provider is required", route.ExternalModel, j)
+			}
+			if target.BackendModel == "" {
+				return nil, fmt.Errorf("model route %q target[%d] backend_model is required", route.ExternalModel, j)
+			}
+		}
+	}
+
+	externalModels := make(map[string]struct{}, len(cfg.ModelRoutes))
+	for _, route := range cfg.ModelRoutes {
+		if _, exists := externalModels[route.ExternalModel]; exists {
+			return nil, fmt.Errorf("duplicate model route %q", route.ExternalModel)
+		}
+		externalModels[route.ExternalModel] = struct{}{}
 	}
 
 	return &cfg, nil

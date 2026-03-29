@@ -10,14 +10,16 @@ import (
 	"strings"
 	"testing"
 
+	anthropicclient "github.com/jiayx/llmio/internal/clients/anthropic"
+	openaiclient "github.com/jiayx/llmio/internal/clients/openai"
 	"github.com/jiayx/llmio/internal/config"
-	"github.com/jiayx/llmio/internal/core"
-	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
-	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
-	"github.com/jiayx/llmio/internal/providers"
+	"github.com/jiayx/llmio/internal/llm"
+	providerapi "github.com/jiayx/llmio/internal/providers/api"
+	anthropicproto "github.com/jiayx/llmio/internal/wire/anthropic"
+	openaiproto "github.com/jiayx/llmio/internal/wire/openai"
 )
 
-func TestAnthropicToCore(t *testing.T) {
+func TestAnthropicToLLM(t *testing.T) {
 	temp := 0.2
 	req := anthropicproto.MessagesRequest{
 		Model: "claude-proxy",
@@ -35,14 +37,14 @@ func TestAnthropicToCore(t *testing.T) {
 		},
 	}
 
-	got, err := anthropicToCore(req)
+	got, err := anthropicclient.MessagesRequestToLLM(req)
 	if err != nil {
-		t.Fatalf("anthropicToCore() error = %v", err)
+		t.Fatalf("MessagesRequestToLLM() error = %v", err)
 	}
 	if got.Model != "claude-proxy" {
 		t.Fatalf("model = %q", got.Model)
 	}
-	if contentText(got.System) != "You are concise." {
+	if llm.ContentText(got.System) != "You are concise." {
 		t.Fatalf("system = %#v", got.System)
 	}
 	if len(got.Messages) != 2 {
@@ -53,8 +55,8 @@ func TestAnthropicToCore(t *testing.T) {
 	}
 }
 
-func TestCoreResponseToAnthropic(t *testing.T) {
-	got := coreResponseToAnthropic("claude-compatible", &core.ChatResponse{
+func TestLLMResponseToAnthropic(t *testing.T) {
+	got := anthropicclient.MessagesResponseFromLLM("claude-compatible", &llm.ChatResponse{
 		ID:           "chatcmpl-1",
 		Model:        "deepseek-chat",
 		OutputText:   "world",
@@ -102,7 +104,7 @@ func TestDispatchChatFallback(t *testing.T) {
 	s := &Server{
 		providers: map[string]chatProvider{
 			"primary": fakeProvider{chatErr: errors.New("provider primary returned status 503: busy")},
-			"secondary": fakeProvider{chatResp: &core.ChatResponse{
+			"secondary": fakeProvider{chatResp: &llm.ChatResponse{
 				ID:         "ok",
 				Model:      "deepseek-chat",
 				OutputText: "hi",
@@ -115,9 +117,9 @@ func TestDispatchChatFallback(t *testing.T) {
 			{ProviderName: "primary", BackendModel: "a"},
 			{ProviderName: "secondary", BackendModel: "b"},
 		},
-	}, core.ChatRequest{
+	}, llm.ChatRequest{
 		Model:    "proxy",
-		Messages: []core.Message{{Role: "user", Content: []core.ContentPart{{Type: core.ContentTypeText, Text: "hello"}}}},
+		Messages: []llm.Message{{Role: "user", Content: []llm.ContentPart{{Type: llm.ContentTypeText, Text: "hello"}}}},
 	})
 	if err != nil {
 		t.Fatalf("dispatchChat() error = %v", err)
@@ -127,7 +129,7 @@ func TestDispatchChatFallback(t *testing.T) {
 	}
 }
 
-func TestOpenAIRequestToCore(t *testing.T) {
+func TestOpenAIRequestToLLM(t *testing.T) {
 	maxTokens := 64
 	req := openaiproto.ChatCompletionRequest{
 		Model: "gpt-proxy",
@@ -140,8 +142,11 @@ func TestOpenAIRequestToCore(t *testing.T) {
 		User:      "u1",
 	}
 
-	got := openAIRequestToCore(req)
-	if contentText(got.System) != "sys" {
+	got, err := openaiclient.ChatCompletionRequestToLLM(req)
+	if err != nil {
+		t.Fatalf("ChatCompletionRequestToLLM() error = %v", err)
+	}
+	if llm.ContentText(got.System) != "sys" {
 		t.Fatalf("system = %#v", got.System)
 	}
 	if got.MaxTokens != 64 || !got.Stream || got.User != "u1" {
@@ -149,9 +154,24 @@ func TestOpenAIRequestToCore(t *testing.T) {
 	}
 }
 
-func TestWriteCoreResponseAsOpenAI(t *testing.T) {
+func TestOpenAIRequestToLLMRejectsUnsupportedContent(t *testing.T) {
+	_, err := openaiclient.ChatCompletionRequestToLLM(openaiproto.ChatCompletionRequest{
+		Model: "gpt-proxy",
+		Messages: []openaiproto.Message{{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "audio_url", "audio_url": "https://example.com/a.mp3"},
+			},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported content type") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWriteLLMResponseAsOpenAI(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeCoreResponseAsOpenAI(rec, "gpt-proxy", &core.ChatResponse{
+	openaiclient.WriteChatCompletionResponse(rec, "gpt-proxy", &llm.ChatResponse{
 		ID:           "1",
 		OutputText:   "hello",
 		FinishReason: "stop",
@@ -168,7 +188,7 @@ func TestWriteCoreResponseAsOpenAI(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesRequestToCore(t *testing.T) {
+func TestOpenAIResponsesRequestToLLM(t *testing.T) {
 	maxOutputTokens := 128
 	req := openaiproto.ResponsesRequest{
 		Model:           "gpt-proxy",
@@ -190,23 +210,56 @@ func TestOpenAIResponsesRequestToCore(t *testing.T) {
 		},
 	}
 
-	got, err := openAIResponsesRequestToCore(req)
+	got, err := openaiclient.ResponsesRequestToLLM(req)
 	if err != nil {
-		t.Fatalf("openAIResponsesRequestToCore() error = %v", err)
+		t.Fatalf("ResponsesRequestToLLM() error = %v", err)
 	}
-	if contentText(got.System) != "be brief\nFollow policy." {
+	if llm.ContentText(got.System) != "be brief\nFollow policy." {
 		t.Fatalf("system = %#v", got.System)
 	}
 	if got.MaxTokens != 128 {
 		t.Fatalf("max_tokens = %d", got.MaxTokens)
 	}
-	if len(got.Messages) != 1 || got.Messages[0].Role != "user" || contentText(got.Messages[0].Content) != "hello" {
+	if len(got.Messages) != 1 || got.Messages[0].Role != "user" || llm.ContentText(got.Messages[0].Content) != "hello" {
 		t.Fatalf("messages = %#v", got.Messages)
 	}
 }
 
-func TestCoreResponseToOpenAIResponse(t *testing.T) {
-	got := coreResponseToOpenAIResponse("gpt-proxy", &core.ChatResponse{
+func TestOpenAIResponsesRequestToLLMFunctionCallOutput(t *testing.T) {
+	req := openaiproto.ResponsesRequest{
+		Model: "gpt-proxy",
+		Input: []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "lookup",
+				"call_id":   "call_1",
+				"arguments": `{"q":"hello"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_1",
+				"output":  "done",
+			},
+		},
+	}
+
+	got, err := openaiclient.ResponsesRequestToLLM(req)
+	if err != nil {
+		t.Fatalf("ResponsesRequestToLLM() error = %v", err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages = %#v", got.Messages)
+	}
+	if got.Messages[0].Role != "assistant" || got.Messages[0].Content[0].Type != llm.ContentTypeToolCall {
+		t.Fatalf("message0 = %#v", got.Messages[0])
+	}
+	if got.Messages[1].Role != "user" || got.Messages[1].Content[0].Type != llm.ContentTypeToolResult || got.Messages[1].Content[0].Output != "done" {
+		t.Fatalf("message1 = %#v", got.Messages[1])
+	}
+}
+
+func TestLLMResponseToOpenAIResponse(t *testing.T) {
+	got := openaiclient.ResponsesResponseFromLLM("gpt-proxy", &llm.ChatResponse{
 		ID:           "resp_1",
 		OutputText:   "hello",
 		InputTokens:  10,
@@ -229,7 +282,7 @@ func TestCoreResponseToOpenAIResponse(t *testing.T) {
 func TestHandleOpenAIResponses(t *testing.T) {
 	s := &Server{
 		providers: map[string]chatProvider{
-			"primary": fakeProvider{chatResp: &core.ChatResponse{
+			"primary": fakeProvider{chatResp: &llm.ChatResponse{
 				ID:           "resp_1",
 				OutputText:   "world",
 				InputTokens:  3,
@@ -263,7 +316,7 @@ func TestHandleOpenAIResponses(t *testing.T) {
 	}
 }
 
-func TestAnthropicToCoreToolAndImage(t *testing.T) {
+func TestAnthropicToLLMToolAndImage(t *testing.T) {
 	req := anthropicproto.MessagesRequest{
 		Model: "claude-proxy",
 		Messages: []anthropicproto.Message{
@@ -294,22 +347,22 @@ func TestAnthropicToCoreToolAndImage(t *testing.T) {
 		},
 	}
 
-	got, err := anthropicToCore(req)
+	got, err := anthropicclient.MessagesRequestToLLM(req)
 	if err != nil {
-		t.Fatalf("anthropicToCore() error = %v", err)
+		t.Fatalf("MessagesRequestToLLM() error = %v", err)
 	}
-	if got.Messages[0].Content[0].Type != core.ContentTypeImage {
+	if got.Messages[0].Content[0].Type != llm.ContentTypeImage {
 		t.Fatalf("message0 = %#v", got.Messages[0].Content)
 	}
-	if got.Messages[0].Content[1].Type != core.ContentTypeToolResult {
+	if got.Messages[0].Content[1].Type != llm.ContentTypeToolResult {
 		t.Fatalf("message0 = %#v", got.Messages[0].Content)
 	}
-	if got.Messages[1].Content[0].Type != core.ContentTypeToolCall {
+	if got.Messages[1].Content[0].Type != llm.ContentTypeToolCall {
 		t.Fatalf("message1 = %#v", got.Messages[1].Content)
 	}
 }
 
-func TestOpenAIRequestToCoreToolCalls(t *testing.T) {
+func TestOpenAIRequestToLLMToolCalls(t *testing.T) {
 	req := openaiproto.ChatCompletionRequest{
 		Model: "gpt-proxy",
 		Messages: []openaiproto.Message{
@@ -339,14 +392,17 @@ func TestOpenAIRequestToCoreToolCalls(t *testing.T) {
 		}},
 	}
 
-	got := openAIRequestToCore(req)
+	got, err := openaiclient.ChatCompletionRequestToLLM(req)
+	if err != nil {
+		t.Fatalf("ChatCompletionRequestToLLM() error = %v", err)
+	}
 	if len(got.Tools) != 1 || got.Tools[0].Name != "lookup" {
 		t.Fatalf("tools = %#v", got.Tools)
 	}
-	if got.Messages[0].Content[0].Type != core.ContentTypeToolCall {
+	if got.Messages[0].Content[0].Type != llm.ContentTypeToolCall {
 		t.Fatalf("message0 = %#v", got.Messages[0].Content)
 	}
-	if got.Messages[1].Content[0].Type != core.ContentTypeToolResult {
+	if got.Messages[1].Content[0].Type != llm.ContentTypeToolResult {
 		t.Fatalf("message1 = %#v", got.Messages[1].Content)
 	}
 }
@@ -449,14 +505,14 @@ func TestHandleOpenAIResponsesPassthrough(t *testing.T) {
 
 func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 	p := &fakePassthroughProvider{
-		chatResp: &core.ChatResponse{
+		chatResp: &llm.ChatResponse{
 			ID:           "resp_1",
 			OutputText:   "fallback",
 			InputTokens:  3,
 			OutputTokens: 4,
 		},
 		openAIAPIs: map[string]struct{}{
-			providers.OpenAIAPIChatCompletions: {},
+			providerapi.OpenAIAPIChatCompletions: {},
 		},
 	}
 	s := &Server{
@@ -492,7 +548,7 @@ func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 func TestHandlerSupportsRootOpenAIResponsesAlias(t *testing.T) {
 	s := &Server{
 		providers: map[string]chatProvider{
-			"primary": fakeProvider{chatResp: &core.ChatResponse{
+			"primary": fakeProvider{chatResp: &llm.ChatResponse{
 				ID:           "resp_1",
 				OutputText:   "world",
 				InputTokens:  3,
@@ -515,6 +571,34 @@ func TestHandlerSupportsRootOpenAIResponsesAlias(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleOpenAIChatCompletionsMethodNotAllowed(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+
+	s.handleOpenAIChatCompletions(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("allow = %q", rec.Header().Get("Allow"))
+	}
+}
+
+func TestHandleAnthropicMessagesMethodNotAllowed(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/messages", nil)
+
+	s.handleAnthropicMessages(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"error"`) {
+		t.Fatalf("body = %s", rec.Body.String())
 	}
 }
 
@@ -562,7 +646,7 @@ func TestWritePassthroughResponseSSEModelRewrite(t *testing.T) {
 		Body: io.NopCloser(strings.NewReader("event: message\ndata: {\"model\":\"backend-model\"}\n\ndata: [DONE]\n\n")),
 	}
 
-	writePassthroughResponse(rec, resp, "openai", "gpt-proxy")
+	openaiclient.WritePassthroughResponse(rec, resp, "gpt-proxy")
 	body := rec.Body.String()
 	if !strings.Contains(body, `"model":"gpt-proxy"`) {
 		t.Fatalf("body = %s", body)
@@ -574,9 +658,9 @@ func TestWritePassthroughResponseSSEModelRewrite(t *testing.T) {
 
 func TestHandleOpenAIStreamToolCall(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hel`},
-		core.StreamEvent{Type: core.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolInput: `lo"}`},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "tool_calls"},
+		llm.StreamEvent{Type: llm.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hel`},
+		llm.StreamEvent{Type: llm.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolInput: `lo"}`},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "tool_calls"},
 	)
 	s := &Server{
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
@@ -584,7 +668,7 @@ func TestHandleOpenAIStreamToolCall(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleOpenAIStream(rec, req, modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "gpt-proxy"})
+	s.handleOpenAIStream(rec, req, modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "gpt-proxy"})
 	body := rec.Body.String()
 	if !strings.Contains(body, `"tool_calls"`) || !strings.Contains(body, `"lookup"`) || !strings.Contains(body, `[DONE]`) {
 		t.Fatalf("body = %s", body)
@@ -593,8 +677,8 @@ func TestHandleOpenAIStreamToolCall(t *testing.T) {
 
 func TestHandleOpenAIStreamReasoning(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventDelta, Part: core.ContentPart{Type: core.ContentTypeReasoning}, TextDelta: "think"},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "stop"},
+		llm.StreamEvent{Type: llm.StreamEventDelta, Part: llm.ContentPart{Type: llm.ContentTypeReasoning}, TextDelta: "think"},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "stop"},
 	)
 	s := &Server{
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
@@ -602,7 +686,7 @@ func TestHandleOpenAIStreamReasoning(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleOpenAIStream(rec, req, modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "gpt-proxy"})
+	s.handleOpenAIStream(rec, req, modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "gpt-proxy"})
 	body := rec.Body.String()
 	if !strings.Contains(body, `"reasoning":"think"`) || !strings.Contains(body, `[DONE]`) {
 		t.Fatalf("body = %s", body)
@@ -611,8 +695,8 @@ func TestHandleOpenAIStreamReasoning(t *testing.T) {
 
 func TestHandleOpenAIResponsesStreamToolCall(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hi"}`},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "tool_calls"},
+		llm.StreamEvent{Type: llm.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hi"}`},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "tool_calls"},
 	)
 	s := &Server{
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
@@ -620,7 +704,7 @@ func TestHandleOpenAIResponsesStreamToolCall(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleOpenAIResponsesStream(rec, req, "gpt-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "gpt-proxy"})
+	s.handleOpenAIResponsesStream(rec, req, "gpt-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "gpt-proxy"})
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.function_call_arguments.delta") || !strings.Contains(body, "response.output_item.done") || !strings.Contains(body, `"call_id":"call_1"`) {
 		t.Fatalf("body = %s", body)
@@ -629,10 +713,10 @@ func TestHandleOpenAIResponsesStreamToolCall(t *testing.T) {
 
 func TestHandleOpenAIResponsesStreamReasoningAndImage(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventContentStart, BlockIndex: 1, Part: core.ContentPart{Type: core.ContentTypeImage, URL: "https://example.com/image.png"}},
-		core.StreamEvent{Type: core.StreamEventDelta, Part: core.ContentPart{Type: core.ContentTypeReasoning}, TextDelta: "think"},
-		core.StreamEvent{Type: core.StreamEventContentStop, BlockIndex: 1, Part: core.ContentPart{Type: core.ContentTypeImage, URL: "https://example.com/image.png"}},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "stop"},
+		llm.StreamEvent{Type: llm.StreamEventContentStart, BlockIndex: 1, Part: llm.ContentPart{Type: llm.ContentTypeImage, URL: "https://example.com/image.png"}},
+		llm.StreamEvent{Type: llm.StreamEventDelta, Part: llm.ContentPart{Type: llm.ContentTypeReasoning}, TextDelta: "think"},
+		llm.StreamEvent{Type: llm.StreamEventContentStop, BlockIndex: 1, Part: llm.ContentPart{Type: llm.ContentTypeImage, URL: "https://example.com/image.png"}},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "stop"},
 	)
 	s := &Server{
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
@@ -640,7 +724,7 @@ func TestHandleOpenAIResponsesStreamReasoningAndImage(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleOpenAIResponsesStream(rec, req, "gpt-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "gpt-proxy"})
+	s.handleOpenAIResponsesStream(rec, req, "gpt-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "gpt-proxy"})
 	body := rec.Body.String()
 	if !strings.Contains(body, "response.reasoning.delta") || !strings.Contains(body, "response.reasoning.done") || !strings.Contains(body, "image.png") {
 		t.Fatalf("body = %s", body)
@@ -648,13 +732,13 @@ func TestHandleOpenAIResponsesStreamReasoningAndImage(t *testing.T) {
 }
 
 func TestHandleOpenAIResponsesStreamContextCanceledDoesNotWrite502(t *testing.T) {
-	events := make(chan core.StreamEvent)
+	events := make(chan llm.StreamEvent)
 	errs := make(chan error, 1)
 	errs <- context.Canceled
 	close(errs)
 
 	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: &providers.StreamReader{
+		providers: map[string]chatProvider{"p": fakeProvider{stream: &providerapi.StreamReader{
 			Events: events,
 			Err:    errs,
 			Close: func() error {
@@ -665,7 +749,7 @@ func TestHandleOpenAIResponsesStreamContextCanceledDoesNotWrite502(t *testing.T)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleOpenAIResponsesStream(rec, req, "gpt-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "gpt-proxy"})
+	s.handleOpenAIResponsesStream(rec, req, "gpt-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "gpt-proxy"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -676,8 +760,8 @@ func TestHandleOpenAIResponsesStreamContextCanceledDoesNotWrite502(t *testing.T)
 
 func TestHandleAnthropicStreamToolCall(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventTool, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hi"}`},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "tool_use"},
+		llm.StreamEvent{Type: llm.StreamEventTool, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hi"}`},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "tool_use"},
 	)
 	s := &Server{
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
@@ -685,7 +769,7 @@ func TestHandleAnthropicStreamToolCall(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleAnthropicStream(rec, req, "claude-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "claude-proxy"})
+	s.handleAnthropicStream(rec, req, "claude-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "claude-proxy"})
 	body := rec.Body.String()
 	if !strings.Contains(body, `"type":"tool_use"`) || !strings.Contains(body, `"input_json_delta"`) || !strings.Contains(body, `"message_stop"`) {
 		t.Fatalf("body = %s", body)
@@ -694,9 +778,9 @@ func TestHandleAnthropicStreamToolCall(t *testing.T) {
 
 func TestHandleAnthropicStreamImageBlock(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventContentStart, BlockIndex: 2, Part: core.ContentPart{Type: core.ContentTypeImage, MediaType: "image/png", Data: "abc"}},
-		core.StreamEvent{Type: core.StreamEventContentStop, BlockIndex: 2, Part: core.ContentPart{Type: core.ContentTypeImage, MediaType: "image/png", Data: "abc"}},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "end_turn"},
+		llm.StreamEvent{Type: llm.StreamEventContentStart, BlockIndex: 2, Part: llm.ContentPart{Type: llm.ContentTypeImage, MediaType: "image/png", Data: "abc"}},
+		llm.StreamEvent{Type: llm.StreamEventContentStop, BlockIndex: 2, Part: llm.ContentPart{Type: llm.ContentTypeImage, MediaType: "image/png", Data: "abc"}},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "end_turn"},
 	)
 	s := &Server{
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
@@ -704,7 +788,7 @@ func TestHandleAnthropicStreamImageBlock(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
 	rec := httptest.NewRecorder()
 
-	s.handleAnthropicStream(rec, req, "claude-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, core.ChatRequest{Model: "claude-proxy"})
+	s.handleAnthropicStream(rec, req, "claude-proxy", modelRoute{Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}}, llm.ChatRequest{Model: "claude-proxy"})
 	body := rec.Body.String()
 	if !strings.Contains(body, `"type":"image"`) || !strings.Contains(body, `"content_block_stop"`) || !strings.Contains(body, `"message_stop"`) {
 		t.Fatalf("body = %s", body)
@@ -713,8 +797,8 @@ func TestHandleAnthropicStreamImageBlock(t *testing.T) {
 
 func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 	stream := testStream(
-		core.StreamEvent{Type: core.StreamEventDelta, Part: core.ContentPart{Type: core.ContentTypeText}, TextDelta: "hello"},
-		core.StreamEvent{Type: core.StreamEventStop, FinishReason: "end_turn"},
+		llm.StreamEvent{Type: llm.StreamEventDelta, Part: llm.ContentPart{Type: llm.ContentTypeText}, TextDelta: "hello"},
+		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "end_turn"},
 	)
 	s := &Server{
 		apiKeys:   map[string]struct{}{},
@@ -746,19 +830,19 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 }
 
 type fakeProvider struct {
-	chatResp  *core.ChatResponse
+	chatResp  *llm.ChatResponse
 	chatErr   error
-	stream    *providers.StreamReader
+	stream    *providerapi.StreamReader
 	streamErr error
 }
 
 func (f fakeProvider) Name() string { return "fake" }
 
-func (f fakeProvider) Chat(context.Context, core.ChatRequest) (*core.ChatResponse, error) {
+func (f fakeProvider) Chat(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
 	return f.chatResp, f.chatErr
 }
 
-func (f fakeProvider) ChatStream(context.Context, core.ChatRequest) (*providers.StreamReader, error) {
+func (f fakeProvider) ChatStream(context.Context, llm.ChatRequest) (*providerapi.StreamReader, error) {
 	if f.streamErr != nil {
 		return nil, f.streamErr
 	}
@@ -768,13 +852,13 @@ func (f fakeProvider) ChatStream(context.Context, core.ChatRequest) (*providers.
 	return nil, errors.New("not implemented")
 }
 
-func testStream(events ...core.StreamEvent) *providers.StreamReader {
-	ch := make(chan core.StreamEvent, len(events))
+func testStream(events ...llm.StreamEvent) *providerapi.StreamReader {
+	ch := make(chan llm.StreamEvent, len(events))
 	for _, event := range events {
 		ch <- event
 	}
 	close(ch)
-	return &providers.StreamReader{
+	return &providerapi.StreamReader{
 		Events: ch,
 		Err:    nil,
 		Close: func() error {
@@ -785,7 +869,7 @@ func testStream(events ...core.StreamEvent) *providers.StreamReader {
 
 type fakePassthroughProvider struct {
 	chatCalled bool
-	chatResp   *core.ChatResponse
+	chatResp   *llm.ChatResponse
 	chatErr    error
 
 	openAIPath     string
@@ -803,7 +887,7 @@ type fakePassthroughProvider struct {
 
 func (f *fakePassthroughProvider) Name() string { return "fake-passthrough" }
 
-func (f *fakePassthroughProvider) Chat(context.Context, core.ChatRequest) (*core.ChatResponse, error) {
+func (f *fakePassthroughProvider) Chat(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
 	f.chatCalled = true
 	if f.chatResp != nil || f.chatErr != nil {
 		return f.chatResp, f.chatErr
@@ -811,7 +895,7 @@ func (f *fakePassthroughProvider) Chat(context.Context, core.ChatRequest) (*core
 	return nil, errors.New("normalized path should not be called")
 }
 
-func (f *fakePassthroughProvider) ChatStream(context.Context, core.ChatRequest) (*providers.StreamReader, error) {
+func (f *fakePassthroughProvider) ChatStream(context.Context, llm.ChatRequest) (*providerapi.StreamReader, error) {
 	f.chatCalled = true
 	return nil, errors.New("normalized path should not be called")
 }
@@ -842,4 +926,26 @@ func (f *fakePassthroughProvider) SupportsAnthropicAPI(apiType string) bool {
 	}
 	_, ok := f.anthropicAPIs[apiType]
 	return ok
+}
+
+func (f *fakePassthroughProvider) SupportsPassthrough(protocol, apiType string) bool {
+	switch protocol {
+	case "openai":
+		return f.SupportsOpenAIAPI(apiType)
+	case "anthropic":
+		return f.SupportsAnthropicAPI(apiType)
+	default:
+		return false
+	}
+}
+
+func (f *fakePassthroughProvider) Forward(ctx context.Context, protocol, path string, body []byte, headers http.Header) (*http.Response, error) {
+	switch protocol {
+	case "openai":
+		return f.ForwardOpenAI(ctx, path, body, headers)
+	case "anthropic":
+		return f.ForwardAnthropic(ctx, path, body, headers)
+	default:
+		return nil, errors.New("unsupported protocol")
+	}
 }

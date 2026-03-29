@@ -1,4 +1,4 @@
-package core
+package llm
 
 // ChatRequest is the normalized request shape shared across providers.
 type ChatRequest struct {

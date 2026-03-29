@@ -1,28 +1,26 @@
-package providers
+package openai
 
 import (
-	"strings"
-
-	"github.com/jiayx/llmio/internal/core"
-	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
+	"github.com/jiayx/llmio/internal/llm"
+	openaiproto "github.com/jiayx/llmio/internal/wire/openai"
 )
 
-func coreToOpenAI(req core.ChatRequest) openaiproto.ChatCompletionRequest {
+func llmToOpenAI(req llm.ChatRequest) openaiproto.ChatCompletionRequest {
 	messages := make([]openaiproto.Message, 0, len(req.Messages)+1)
 	if len(req.System) > 0 {
-		systemContent, _ := corePartsToOpenAIMessage(req.System)
+		systemContent, _ := llmPartsToOpenAIMessage(req.System)
 		messages = append(messages, openaiproto.Message{
 			Role:    "system",
 			Content: systemContent,
 		})
 	}
 	for _, msg := range req.Messages {
-		content, toolCalls := corePartsToOpenAIMessage(msg.Content)
+		content, toolCalls := llmPartsToOpenAIMessage(msg.Content)
 		role := msg.Role
-		if role == "user" && hasOnlyToolResults(msg.Content) {
+		if role == "user" && llm.HasOnlyContentType(msg.Content, llm.ContentTypeToolResult) {
 			role = "tool"
 			for _, part := range msg.Content {
-				if part.Type != core.ContentTypeToolResult {
+				if part.Type != llm.ContentTypeToolResult {
 					continue
 				}
 				messages = append(messages, openaiproto.Message{
@@ -54,13 +52,13 @@ func coreToOpenAI(req core.ChatRequest) openaiproto.ChatCompletionRequest {
 		MaxTokens:   maxTokens,
 		Stream:      req.Stream,
 		User:        req.User,
-		Tools:       coreToolsToOpenAI(req.Tools),
-		ToolChoice:  coreToolChoiceToOpenAI(req.ToolChoice),
+		Tools:       llmToolsToOpenAI(req.Tools),
+		ToolChoice:  llmToolChoiceToOpenAI(req.ToolChoice),
 	}
 }
 
-func openAIToCoreResponse(resp openaiproto.ChatCompletionResponse, raw []byte) *core.ChatResponse {
-	out := &core.ChatResponse{
+func openAIToLLMResponse(resp openaiproto.ChatCompletionResponse, raw []byte) *llm.ChatResponse {
+	out := &llm.ChatResponse{
 		ID:    resp.ID,
 		Model: resp.Model,
 		Raw:   raw,
@@ -71,24 +69,24 @@ func openAIToCoreResponse(resp openaiproto.ChatCompletionResponse, raw []byte) *
 	}
 	if len(resp.Choices) > 0 {
 		out.FinishReason = resp.Choices[0].FinishReason
-		out.Output = openAIMessageToCore(resp.Choices[0].Message)
-		out.OutputText = extractCoreText(out.Output)
+		out.Output = openAIMessageToLLM(resp.Choices[0].Message)
+		out.OutputText = llm.ExtractText(out.Output)
 	}
 	return out
 }
 
-func corePartsToOpenAIMessage(parts []core.ContentPart) (any, []openaiproto.ToolCall) {
+func llmPartsToOpenAIMessage(parts []llm.ContentPart) (any, []openaiproto.ToolCall) {
 	var content []map[string]any
 	var toolCalls []openaiproto.ToolCall
 	for _, part := range parts {
 		switch part.Type {
-		case core.ContentTypeText:
+		case llm.ContentTypeText:
 			content = append(content, map[string]any{"type": "text", "text": part.Text})
-		case core.ContentTypeImage:
+		case llm.ContentTypeImage:
 			if part.URL != "" {
 				content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
 			}
-		case core.ContentTypeToolCall:
+		case llm.ContentTypeToolCall:
 			toolCalls = append(toolCalls, openaiproto.ToolCall{
 				ID:   part.ToolCallID,
 				Type: "function",
@@ -112,7 +110,7 @@ func corePartsToOpenAIMessage(parts []core.ContentPart) (any, []openaiproto.Tool
 	return out, toolCalls
 }
 
-func coreToolsToOpenAI(tools []core.ToolDefinition) []openaiproto.Tool {
+func llmToolsToOpenAI(tools []llm.ToolDefinition) []openaiproto.Tool {
 	out := make([]openaiproto.Tool, 0, len(tools))
 	for _, tool := range tools {
 		out = append(out, openaiproto.Tool{
@@ -127,7 +125,7 @@ func coreToolsToOpenAI(tools []core.ToolDefinition) []openaiproto.Tool {
 	return out
 }
 
-func coreToolChoiceToOpenAI(choice *core.ToolChoice) any {
+func llmToolChoiceToOpenAI(choice *llm.ToolChoice) any {
 	if choice == nil {
 		return nil
 	}
@@ -142,12 +140,12 @@ func coreToolChoiceToOpenAI(choice *core.ToolChoice) any {
 	}
 }
 
-func openAIMessageToCore(msg openaiproto.Message) []core.ContentPart {
-	parts := make([]core.ContentPart, 0)
+func openAIMessageToLLM(msg openaiproto.Message) []llm.ContentPart {
+	parts := make([]llm.ContentPart, 0)
 	switch v := msg.Content.(type) {
 	case string:
 		if v != "" {
-			parts = append(parts, core.ContentPart{Type: core.ContentTypeText, Text: v})
+			parts = append(parts, llm.ContentPart{Type: llm.ContentTypeText, Text: v})
 		}
 	case []any:
 		for _, item := range v {
@@ -157,45 +155,23 @@ func openAIMessageToCore(msg openaiproto.Message) []core.ContentPart {
 			}
 			switch m["type"] {
 			case "text":
-				parts = append(parts, core.ContentPart{Type: core.ContentTypeText, Text: stringValue(m["text"])})
+				parts = append(parts, llm.ContentPart{Type: llm.ContentTypeText, Text: stringValue(m["text"])})
 			case "image_url":
 				if image, ok := m["image_url"].(map[string]any); ok {
-					parts = append(parts, core.ContentPart{Type: core.ContentTypeImage, URL: stringValue(image["url"])})
+					parts = append(parts, llm.ContentPart{Type: llm.ContentTypeImage, URL: stringValue(image["url"])})
 				}
 			}
 		}
 	}
 	for _, call := range msg.ToolCalls {
-		parts = append(parts, core.ContentPart{
-			Type:       core.ContentTypeToolCall,
+		parts = append(parts, llm.ContentPart{
+			Type:       llm.ContentTypeToolCall,
 			Name:       call.Function.Name,
 			ToolCallID: call.ID,
 			Input:      call.Function.Arguments,
 		})
 	}
 	return parts
-}
-
-func extractCoreText(parts []core.ContentPart) string {
-	var texts []string
-	for _, part := range parts {
-		if part.Type == core.ContentTypeText && part.Text != "" {
-			texts = append(texts, part.Text)
-		}
-	}
-	return strings.Join(texts, "\n")
-}
-
-func hasOnlyToolResults(parts []core.ContentPart) bool {
-	if len(parts) == 0 {
-		return false
-	}
-	for _, part := range parts {
-		if part.Type != core.ContentTypeToolResult {
-			return false
-		}
-	}
-	return true
 }
 
 func stringValue(v any) string {

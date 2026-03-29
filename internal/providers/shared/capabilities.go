@@ -1,6 +1,6 @@
-package providers
+package providershared
 
-func newAPISupportSet(apiTypes []string) map[string]struct{} {
+func NewAPISupportSet(apiTypes []string) map[string]struct{} {
 	if len(apiTypes) == 0 {
 		return nil
 	}
@@ -14,7 +14,7 @@ func newAPISupportSet(apiTypes []string) map[string]struct{} {
 	return out
 }
 
-func supportsAPIType(supported map[string]struct{}, apiType string) bool {
+func SupportsAPIType(supported map[string]struct{}, apiType string) bool {
 	if len(supported) == 0 {
 		return true
 	}

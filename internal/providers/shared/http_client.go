@@ -1,4 +1,4 @@
-package providers
+package providershared
 
 import (
 	"bytes"
@@ -11,20 +11,20 @@ import (
 	"strings"
 )
 
-type requestMutator func(*http.Request)
+type RequestMutator func(*http.Request)
 
-type providerHTTPClient struct {
+type HTTPClient struct {
 	baseURL   string
 	headers   map[string]string
 	client    *http.Client
-	customize requestMutator
+	customize RequestMutator
 }
 
-func newProviderHTTPClient(baseURL string, headers map[string]string, client *http.Client, customize requestMutator) *providerHTTPClient {
+func NewHTTPClient(baseURL string, headers map[string]string, client *http.Client, customize RequestMutator) *HTTPClient {
 	if client == nil {
 		client = &http.Client{}
 	}
-	return &providerHTTPClient{
+	return &HTTPClient{
 		baseURL:   baseURL,
 		headers:   headers,
 		client:    client,
@@ -32,7 +32,7 @@ func newProviderHTTPClient(baseURL string, headers map[string]string, client *ht
 	}
 }
 
-func (c *providerHTTPClient) Do(ctx context.Context, method, path string, body []byte, inboundHeaders http.Header) (*http.Response, error) {
+func (c *HTTPClient) Do(ctx context.Context, method, path string, body []byte, inboundHeaders http.Header) (*http.Response, error) {
 	target, err := url.JoinPath(c.baseURL, strings.TrimPrefix(path, "/"))
 	if err != nil {
 		return nil, fmt.Errorf("join path: %w", err)
@@ -75,7 +75,7 @@ func (c *providerHTTPClient) Do(ctx context.Context, method, path string, body [
 
 func copyForwardHeaders(dst, src http.Header) {
 	for k, vals := range src {
-		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "x-api-key") {
+		if shouldSkipForwardHeader(k) {
 			continue
 		}
 		for _, v := range vals {
@@ -84,7 +84,26 @@ func copyForwardHeaders(dst, src http.Header) {
 	}
 }
 
-func closeResponseBody(scope string, body io.Closer) {
+func shouldSkipForwardHeader(name string) bool {
+	switch {
+	case strings.EqualFold(name, "Authorization"),
+		strings.EqualFold(name, "x-api-key"),
+		strings.EqualFold(name, "Connection"),
+		strings.EqualFold(name, "Proxy-Connection"),
+		strings.EqualFold(name, "Keep-Alive"),
+		strings.EqualFold(name, "Proxy-Authenticate"),
+		strings.EqualFold(name, "Proxy-Authorization"),
+		strings.EqualFold(name, "Te"),
+		strings.EqualFold(name, "Trailer"),
+		strings.EqualFold(name, "Transfer-Encoding"),
+		strings.EqualFold(name, "Upgrade"):
+		return true
+	default:
+		return false
+	}
+}
+
+func CloseResponseBody(scope string, body io.Closer) {
 	if body == nil {
 		return
 	}

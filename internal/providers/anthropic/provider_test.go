@@ -1,4 +1,4 @@
-package providers
+package anthropic
 
 import (
 	"context"
@@ -7,22 +7,23 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jiayx/llmio/internal/core"
-	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
+	"github.com/jiayx/llmio/internal/llm"
+	providershared "github.com/jiayx/llmio/internal/providers/shared"
+	anthropicproto "github.com/jiayx/llmio/internal/wire/anthropic"
 )
 
-func TestCoreToAnthropic(t *testing.T) {
+func TestLLMToAnthropic(t *testing.T) {
 	temp := 0.3
-	req := core.ChatRequest{
+	req := llm.ChatRequest{
 		Model:       "claude-3-7-sonnet",
-		System:      []core.ContentPart{{Type: core.ContentTypeText, Text: "be concise"}},
-		Messages:    []core.Message{{Role: "user", Content: []core.ContentPart{{Type: core.ContentTypeText, Text: "hello"}}}},
+		System:      []llm.ContentPart{{Type: llm.ContentTypeText, Text: "be concise"}},
+		Messages:    []llm.Message{{Role: "user", Content: []llm.ContentPart{{Type: llm.ContentTypeText, Text: "hello"}}}},
 		MaxTokens:   256,
 		Temperature: &temp,
 		User:        "u-1",
 	}
 
-	got := coreToAnthropic(req)
+	got := llmToAnthropic(req)
 	if got.Model != "claude-3-7-sonnet" || got.MaxTokens != 256 {
 		t.Fatalf("request = %#v", got)
 	}
@@ -38,8 +39,8 @@ func TestCoreToAnthropic(t *testing.T) {
 	}
 }
 
-func TestAnthropicToCoreResponse(t *testing.T) {
-	got := anthropicToCoreResponse(anthropicproto.MessagesResponse{
+func TestAnthropicToLLMResponse(t *testing.T) {
+	got := anthropicToLLMResponse(anthropicproto.MessagesResponse{
 		ID:         "msg_1",
 		Model:      "claude-3-7-sonnet",
 		StopReason: "end_turn",
@@ -57,17 +58,17 @@ func TestAnthropicToCoreResponse(t *testing.T) {
 	}
 }
 
-func TestAnthropicSSEToCoreEvents(t *testing.T) {
-	events := make(chan core.StreamEvent, 8)
+func TestAnthropicSSEToLLMEvents(t *testing.T) {
+	events := make(chan llm.StreamEvent, 8)
 	blockState := make(map[int]anthropicproto.ContentBlock)
 
-	if err := anthropicSSEToCoreEvents("message_start", `{"type":"message_start","message":{"usage":{"input_tokens":12}}}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("message_start", `{"type":"message_start","message":{"usage":{"input_tokens":12}}}`, blockState, events); err != nil {
 		t.Fatalf("message_start error = %v", err)
 	}
-	if err := anthropicSSEToCoreEvents("content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("content_block_delta", `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}}`, blockState, events); err != nil {
 		t.Fatalf("content_block_delta error = %v", err)
 	}
-	if err := anthropicSSEToCoreEvents("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`, blockState, events); err != nil {
 		t.Fatalf("message_delta error = %v", err)
 	}
 
@@ -76,62 +77,62 @@ func TestAnthropicSSEToCoreEvents(t *testing.T) {
 	third := <-events
 	fourth := <-events
 
-	if first.Type != core.StreamEventUsage || first.InputTokens != 12 {
+	if first.Type != llm.StreamEventUsage || first.InputTokens != 12 {
 		t.Fatalf("first = %#v", first)
 	}
-	if second.Type != core.StreamEventDelta || second.TextDelta != "hel" {
+	if second.Type != llm.StreamEventDelta || second.TextDelta != "hel" {
 		t.Fatalf("second = %#v", second)
 	}
-	if third.Type != core.StreamEventUsage || third.OutputTokens != 5 {
+	if third.Type != llm.StreamEventUsage || third.OutputTokens != 5 {
 		t.Fatalf("third = %#v", third)
 	}
-	if fourth.Type != core.StreamEventStop || fourth.FinishReason != "end_turn" {
+	if fourth.Type != llm.StreamEventStop || fourth.FinishReason != "end_turn" {
 		t.Fatalf("fourth = %#v", fourth)
 	}
 }
 
-func TestAnthropicSSEToCoreToolEvents(t *testing.T) {
-	events := make(chan core.StreamEvent, 8)
+func TestAnthropicSSEToLLMToolEvents(t *testing.T) {
+	events := make(chan llm.StreamEvent, 8)
 	blockState := make(map[int]anthropicproto.ContentBlock)
 
-	if err := anthropicSSEToCoreEvents("content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"hel"}}}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"hel"}}}`, blockState, events); err != nil {
 		t.Fatalf("content_block_start error = %v", err)
 	}
-	if err := anthropicSSEToCoreEvents("content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"lo"}}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"lo"}}`, blockState, events); err != nil {
 		t.Fatalf("content_block_delta error = %v", err)
 	}
 
 	first := <-events
 	second := <-events
 	third := <-events
-	if first.Type != core.StreamEventContentStart || first.Part.Type != core.ContentTypeToolCall {
+	if first.Type != llm.StreamEventContentStart || first.Part.Type != llm.ContentTypeToolCall {
 		t.Fatalf("first = %#v", first)
 	}
-	if second.Type != core.StreamEventTool || second.ToolCallID != "call_1" || second.ToolName != "lookup" {
+	if second.Type != llm.StreamEventTool || second.ToolCallID != "call_1" || second.ToolName != "lookup" {
 		t.Fatalf("second = %#v", second)
 	}
-	if third.Type != core.StreamEventTool || third.ToolInput != "lo" {
+	if third.Type != llm.StreamEventTool || third.ToolInput != "lo" {
 		t.Fatalf("third = %#v", third)
 	}
 }
 
-func TestAnthropicSSEToCoreImageLifecycle(t *testing.T) {
-	events := make(chan core.StreamEvent, 8)
+func TestAnthropicSSEToLLMImageLifecycle(t *testing.T) {
+	events := make(chan llm.StreamEvent, 8)
 	blockState := make(map[int]anthropicproto.ContentBlock)
 
-	if err := anthropicSSEToCoreEvents("content_block_start", `{"type":"content_block_start","index":2,"content_block":{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("content_block_start", `{"type":"content_block_start","index":2,"content_block":{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}}`, blockState, events); err != nil {
 		t.Fatalf("content_block_start error = %v", err)
 	}
-	if err := anthropicSSEToCoreEvents("content_block_stop", `{"index":2}`, blockState, events); err != nil {
+	if err := anthropicSSEToLLMEvents("content_block_stop", `{"index":2}`, blockState, events); err != nil {
 		t.Fatalf("content_block_stop error = %v", err)
 	}
 
 	first := <-events
 	second := <-events
-	if first.Type != core.StreamEventContentStart || first.Part.Type != core.ContentTypeImage {
+	if first.Type != llm.StreamEventContentStart || first.Part.Type != llm.ContentTypeImage {
 		t.Fatalf("first = %#v", first)
 	}
-	if second.Type != core.StreamEventContentStop || second.Part.Type != core.ContentTypeImage {
+	if second.Type != llm.StreamEventContentStop || second.Part.Type != llm.ContentTypeImage {
 		t.Fatalf("second = %#v", second)
 	}
 }
@@ -139,7 +140,7 @@ func TestAnthropicSSEToCoreImageLifecycle(t *testing.T) {
 func TestAnthropicNativeChat(t *testing.T) {
 	provider := &AnthropicNative{
 		name: "anthropic",
-		httpClient: newProviderHTTPClient("http://example.com", nil, &http.Client{
+		httpClient: providershared.NewHTTPClient("http://example.com", nil, &http.Client{
 			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 				if req.URL.Path != "/messages" {
 					t.Fatalf("path = %s", req.URL.Path)
@@ -167,9 +168,9 @@ func TestAnthropicNativeChat(t *testing.T) {
 		}),
 	}
 
-	resp, err := provider.Chat(context.Background(), core.ChatRequest{
+	resp, err := provider.Chat(context.Background(), llm.ChatRequest{
 		Model:    "claude-3-7-sonnet",
-		Messages: []core.Message{{Role: "user", Content: []core.ContentPart{{Type: core.ContentTypeText, Text: "hi"}}}},
+		Messages: []llm.Message{{Role: "user", Content: []llm.ContentPart{{Type: llm.ContentTypeText, Text: "hi"}}}},
 	})
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)

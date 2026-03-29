@@ -6,8 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/jiayx/llmio/internal/config"
-	"github.com/jiayx/llmio/internal/gateway"
+	"github.com/jiayx/llmio/internal/app"
 )
 
 func main() {
@@ -21,25 +20,15 @@ func main() {
 		configPath = "llmio.json"
 	}
 
-	cfg, err := config.Load(configPath)
+	application, err := app.Bootstrap(configPath)
 	if err != nil {
-		slog.Error("load config", "path", configPath, "err", err)
+		slog.Error("bootstrap app", "path", configPath, "err", err)
 		os.Exit(1)
 	}
 
-	server, err := gateway.NewServer(cfg)
-	if err != nil {
-		slog.Error("build server", "err", err)
-		os.Exit(1)
-	}
-
-	addr := cfg.Listen
-	if addr == "" {
-		addr = ":8080"
-	}
-
+	addr := application.ListenAddr()
 	slog.Info("server listening", "addr", addr)
-	if err := http.ListenAndServe(addr, server.Handler()); err != nil {
+	if err := http.ListenAndServe(addr, application.Handler()); err != nil {
 		slog.Error("serve", "addr", addr, "err", err)
 		os.Exit(1)
 	}
