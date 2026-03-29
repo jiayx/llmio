@@ -19,12 +19,12 @@ type ProviderAdapter = ChatProvider
 
 // OpenAIPassthroughProvider forwards native OpenAI-compatible requests.
 type OpenAIPassthroughProvider interface {
-	ForwardOpenAI(ctx context.Context, path string, body []byte, headers http.Header) (*http.Response, error)
+	ForwardOpenAI(ctx context.Context, upstreamPath string, body []byte, headers http.Header) (*http.Response, error)
 }
 
 // AnthropicPassthroughProvider forwards native Anthropic-compatible requests.
 type AnthropicPassthroughProvider interface {
-	ForwardAnthropic(ctx context.Context, path string, body []byte, headers http.Header) (*http.Response, error)
+	ForwardAnthropic(ctx context.Context, upstreamPath string, body []byte, headers http.Header) (*http.Response, error)
 }
 
 // PassthroughSupporter reports whether a provider can natively forward a request without normalization.
@@ -34,7 +34,7 @@ type PassthroughSupporter interface {
 
 // PassthroughForwarder forwards a native request using protocol-aware dispatch.
 type PassthroughForwarder interface {
-	Forward(ctx context.Context, protocol, path string, body []byte, headers http.Header) (*http.Response, error)
+	Forward(ctx context.Context, protocol, upstreamPath string, body []byte, headers http.Header) (*http.Response, error)
 }
 
 const (

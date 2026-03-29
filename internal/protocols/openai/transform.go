@@ -7,11 +7,10 @@ import (
 	"time"
 
 	"github.com/jiayx/llmio/internal/llm"
-	wire "github.com/jiayx/llmio/internal/wire/openai"
 )
 
 // ChatCompletionRequestToLLM normalizes one OpenAI chat completions request into the internal LLM model.
-func ChatCompletionRequestToLLM(req wire.ChatCompletionRequest) (llm.ChatRequest, error) {
+func ChatCompletionRequestToLLM(req ChatCompletionRequest) (llm.ChatRequest, error) {
 	out := llm.ChatRequest{
 		Model:       req.Model,
 		Messages:    make([]llm.Message, 0, len(req.Messages)),
@@ -52,7 +51,7 @@ func ChatCompletionRequestToLLM(req wire.ChatCompletionRequest) (llm.ChatRequest
 }
 
 // ResponsesRequestToLLM normalizes one OpenAI responses request into the internal LLM model.
-func ResponsesRequestToLLM(req wire.ResponsesRequest) (llm.ChatRequest, error) {
+func ResponsesRequestToLLM(req ResponsesRequest) (llm.ChatRequest, error) {
 	out := llm.ChatRequest{
 		Model:       req.Model,
 		Messages:    make([]llm.Message, 0, 4),
@@ -83,9 +82,9 @@ func ResponsesRequestToLLM(req wire.ResponsesRequest) (llm.ChatRequest, error) {
 }
 
 // ResponsesResponseFromLLM encodes one internal response as an OpenAI responses payload.
-func ResponsesResponseFromLLM(externalModel string, resp *llm.ChatResponse) wire.ResponsesResponse {
+func ResponsesResponseFromLLM(externalModel string, resp *llm.ChatResponse) ResponsesResponse {
 	parts := resp.EffectiveOutput()
-	return wire.ResponsesResponse{
+	return ResponsesResponse{
 		ID:         resp.ID,
 		Object:     "response",
 		CreatedAt:  time.Now().Unix(),
@@ -93,7 +92,7 @@ func ResponsesResponseFromLLM(externalModel string, resp *llm.ChatResponse) wire
 		Status:     "completed",
 		Output:     responseOutputItems(parts),
 		OutputText: resp.OutputText,
-		Usage: &wire.ResponseUsage{
+		Usage: &ResponseUsage{
 			InputTokens:  resp.InputTokens,
 			OutputTokens: resp.OutputTokens,
 			TotalTokens:  resp.InputTokens + resp.OutputTokens,
@@ -264,7 +263,7 @@ func openAIContentToLLM(role string, content any) ([]llm.ContentPart, error) {
 	}
 }
 
-func openAIToolsToLLM(tools []wire.Tool) []llm.ToolDefinition {
+func openAIToolsToLLM(tools []Tool) []llm.ToolDefinition {
 	out := make([]llm.ToolDefinition, 0, len(tools))
 	for _, tool := range tools {
 		if tool.Type != "" && tool.Type != "function" {
@@ -297,7 +296,7 @@ func openAIToolChoiceToLLM(choice any) *llm.ToolChoice {
 	return nil
 }
 
-func openAIToolCallsToLLM(calls []wire.ToolCall) []llm.ContentPart {
+func openAIToolCallsToLLM(calls []ToolCall) []llm.ContentPart {
 	out := make([]llm.ContentPart, 0, len(calls))
 	for _, call := range calls {
 		out = append(out, llm.ContentPart{

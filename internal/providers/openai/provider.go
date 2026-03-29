@@ -11,9 +11,9 @@ import (
 
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
+	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	providershared "github.com/jiayx/llmio/internal/providers/shared"
-	openaiproto "github.com/jiayx/llmio/internal/wire/openai"
 )
 
 // OpenAICompatible implements a normalized provider backed by an OpenAI-compatible API.
@@ -140,58 +140,20 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 				return
 			}
 
-			var chunk openaiproto.StreamChunk
-			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-				errs <- fmt.Errorf("decode openai stream chunk: %w", err)
+			streamEvents, err := openAIStreamChunkToLLMEvents(payload)
+			if err != nil {
+				errs <- err
 				return
 			}
-			if len(chunk.Choices) > 0 {
-				choice := chunk.Choices[0]
-				if choice.Delta.Content != "" {
-					events <- llm.StreamEvent{
-						Type:      llm.StreamEventDelta,
-						Part:      llm.ContentPart{Type: llm.ContentTypeText},
-						TextDelta: choice.Delta.Content,
-						Raw:       json.RawMessage(payload),
-					}
-				}
-				if choice.Delta.Reasoning != "" {
-					events <- llm.StreamEvent{
-						Type:      llm.StreamEventDelta,
-						Part:      llm.ContentPart{Type: llm.ContentTypeReasoning},
-						TextDelta: choice.Delta.Reasoning,
-						Raw:       json.RawMessage(payload),
-					}
-				}
-				for _, toolCall := range choice.Delta.ToolCalls {
-					if toolCall.ID == "" && toolCall.Function.Name == "" && toolCall.Function.Arguments == "" {
-						continue
-					}
-					events <- llm.StreamEvent{
-						Type:       llm.StreamEventTool,
-						ToolIndex:  toolCall.Index,
-						ToolCallID: toolCall.ID,
-						ToolName:   toolCall.Function.Name,
-						ToolInput:  toolCall.Function.Arguments,
-						Raw:        json.RawMessage(payload),
-					}
-				}
-				if choice.FinishReason != "" {
-					events <- llm.StreamEvent{
-						Type:         llm.StreamEventStop,
-						FinishReason: choice.FinishReason,
-						Raw:          json.RawMessage(payload),
-					}
-					return
+			stop := false
+			for _, event := range streamEvents {
+				events <- event
+				if event.Type == llm.StreamEventStop {
+					stop = true
 				}
 			}
-			if chunk.Usage != nil {
-				events <- llm.StreamEvent{
-					Type:         llm.StreamEventUsage,
-					InputTokens:  chunk.Usage.PromptTokens,
-					OutputTokens: chunk.Usage.CompletionTokens,
-					Raw:          json.RawMessage(payload),
-				}
+			if stop {
+				return
 			}
 		}
 

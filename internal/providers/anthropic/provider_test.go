@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/jiayx/llmio/internal/llm"
+	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
 	providershared "github.com/jiayx/llmio/internal/providers/shared"
-	anthropicproto "github.com/jiayx/llmio/internal/wire/anthropic"
 )
 
 func TestLLMToAnthropic(t *testing.T) {

@@ -11,9 +11,9 @@ import (
 
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
+	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	providershared "github.com/jiayx/llmio/internal/providers/shared"
-	anthropicproto "github.com/jiayx/llmio/internal/wire/anthropic"
 )
 
 // AnthropicNative implements a normalized provider backed by Anthropic's native API.

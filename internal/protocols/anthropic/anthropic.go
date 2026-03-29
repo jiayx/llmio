@@ -9,33 +9,18 @@ import (
 	"net/http"
 	"strings"
 
-	clientmeta "github.com/jiayx/llmio/internal/clients"
 	"github.com/jiayx/llmio/internal/llm"
+	httpio "github.com/jiayx/llmio/internal/protocols/httpio"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
-	transporthttp "github.com/jiayx/llmio/internal/transport/http"
-	wire "github.com/jiayx/llmio/internal/wire/anthropic"
 )
 
 // DecodeMessagesRequest decodes an Anthropic messages request body.
-func DecodeMessagesRequest(body []byte) (wire.MessagesRequest, error) {
-	var req wire.MessagesRequest
+func DecodeMessagesRequest(body []byte) (MessagesRequest, error) {
+	var req MessagesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		return wire.MessagesRequest{}, fmt.Errorf("invalid json: %w", err)
+		return MessagesRequest{}, fmt.Errorf("invalid json: %w", err)
 	}
 	return req, nil
-}
-
-// NewMessagesRequestMeta describes an inbound Anthropic messages request.
-func NewMessagesRequestMeta(req wire.MessagesRequest, body []byte, headers http.Header) clientmeta.RequestMeta {
-	return clientmeta.RequestMeta{
-		Protocol:      clientmeta.ProtocolAnthropic,
-		APIType:       clientmeta.APIMessages,
-		Path:          "/messages",
-		ExternalModel: req.Model,
-		Body:          body,
-		Headers:       headers,
-		Stream:        req.Stream,
-	}
 }
 
 // WriteError writes an Anthropic-style error response.
@@ -46,9 +31,9 @@ func WriteError(w http.ResponseWriter, status int, typ, message string) {
 		"error_type", typ,
 		"message", message,
 	)
-	transporthttp.WriteJSON(w, status, map[string]any{
+	httpio.WriteJSON(w, status, map[string]any{
 		"type": "error",
-		"error": wire.Error{
+		"error": Error{
 			Type:    typ,
 			Message: message,
 		},
@@ -58,24 +43,24 @@ func WriteError(w http.ResponseWriter, status int, typ, message string) {
 // WriteMessagesResponse writes one normalized response as Anthropic messages JSON.
 func WriteMessagesResponse(w http.ResponseWriter, externalModel string, resp *llm.ChatResponse) {
 	parts := resp.EffectiveOutput()
-	out := wire.MessagesResponse{
+	out := MessagesResponse{
 		ID:    resp.ID,
 		Type:  "message",
 		Role:  "assistant",
 		Model: externalModel,
-		Usage: wire.Usage{
+		Usage: Usage{
 			InputTokens:  resp.InputTokens,
 			OutputTokens: resp.OutputTokens,
 		},
 	}
 	out.Content = llmContentToAnthropic(parts)
 	out.StopReason = mapFinishReason(resp.FinishReason)
-	transporthttp.WriteJSON(w, http.StatusOK, out)
+	httpio.WriteJSON(w, http.StatusOK, out)
 }
 
 // WritePassthroughResponse rewrites an upstream Anthropic response back to the external model name.
 func WritePassthroughResponse(w http.ResponseWriter, resp *http.Response, externalModel string) {
-	transporthttp.WritePassthroughResponse(w, resp, func(data []byte) ([]byte, error) {
+	httpio.WritePassthroughResponse(w, resp, func(data []byte) ([]byte, error) {
 		return rewritePassthroughJSONPayload(data, externalModel)
 	})
 }
@@ -95,14 +80,14 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	transporthttp.WriteSSEJSON(w, "message_start", wire.StreamMessageStart{
+	httpio.WriteSSEJSON(w, "message_start", StreamMessageStart{
 		Type: "message_start",
-		Message: wire.MessagesResponse{
+		Message: MessagesResponse{
 			Type:    "message",
 			Role:    "assistant",
 			Model:   externalModel,
-			Content: []wire.ContentBlock{},
-			Usage:   wire.Usage{},
+			Content: []ContentBlock{},
+			Usage:   Usage{},
 		},
 	})
 	flusher.Flush()
@@ -113,7 +98,7 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 	startBlock := func(index int, part llm.ContentPart) {
 		openBlocks[index] = part
 		block := anthropicContentBlockFromPart(part)
-		transporthttp.WriteSSEJSON(w, "content_block_start", wire.StreamContentBlockStart{
+		httpio.WriteSSEJSON(w, "content_block_start", StreamContentBlockStart{
 			Type:         "content_block_start",
 			Index:        index,
 			ContentBlock: block,
@@ -133,7 +118,7 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 		if _, ok := openBlocks[index]; !ok {
 			return
 		}
-		transporthttp.WriteSSEJSON(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		httpio.WriteSSEJSON(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
 		delete(openBlocks, index)
 	}
 
@@ -144,16 +129,16 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 				for index := range openBlocks {
 					stopBlock(index)
 				}
-				transporthttp.WriteSSEJSON(w, "message_delta", wire.StreamMessageDelta{
+				httpio.WriteSSEJSON(w, "message_delta", StreamMessageDelta{
 					Type: "message_delta",
-					Delta: wire.MessageDelta{
+					Delta: MessageDelta{
 						StopReason: "end_turn",
 					},
-					Usage: wire.StreamUsage{
+					Usage: StreamUsage{
 						OutputTokens: outputTokens,
 					},
 				})
-				transporthttp.WriteSSEJSON(w, "message_stop", map[string]string{"type": "message_stop"})
+				httpio.WriteSSEJSON(w, "message_stop", map[string]string{"type": "message_stop"})
 				flusher.Flush()
 				return
 			}
@@ -169,10 +154,10 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 				flusher.Flush()
 			case llm.StreamEventDelta:
 				index := ensureBlock(event.BlockIndex, llm.ContentPart{Type: llm.ContentTypeText})
-				transporthttp.WriteSSEJSON(w, "content_block_delta", wire.StreamContentBlockDelta{
+				httpio.WriteSSEJSON(w, "content_block_delta", StreamContentBlockDelta{
 					Type:  "content_block_delta",
 					Index: index,
-					Delta: wire.ContentTextDelta{
+					Delta: ContentTextDelta{
 						Type: "text_delta",
 						Text: event.TextDelta,
 					},
@@ -185,10 +170,10 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 					Name:       event.ToolName,
 				})
 				if event.ToolInput != "" {
-					transporthttp.WriteSSEJSON(w, "content_block_delta", wire.StreamContentBlockDelta{
+					httpio.WriteSSEJSON(w, "content_block_delta", StreamContentBlockDelta{
 						Type:  "content_block_delta",
 						Index: index,
-						Delta: wire.InputJSONDelta{
+						Delta: InputJSONDelta{
 							Type:        "input_json_delta",
 							PartialJSON: event.ToolInput,
 						},
@@ -204,24 +189,24 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 				for index := range openBlocks {
 					stopBlock(index)
 				}
-				transporthttp.WriteSSEJSON(w, "message_delta", wire.StreamMessageDelta{
+				httpio.WriteSSEJSON(w, "message_delta", StreamMessageDelta{
 					Type: "message_delta",
-					Delta: wire.MessageDelta{
+					Delta: MessageDelta{
 						StopReason: mapFinishReason(event.FinishReason),
 					},
-					Usage: wire.StreamUsage{
+					Usage: StreamUsage{
 						OutputTokens: outputTokens,
 					},
 				})
-				transporthttp.WriteSSEJSON(w, "message_stop", map[string]string{"type": "message_stop"})
+				httpio.WriteSSEJSON(w, "message_stop", map[string]string{"type": "message_stop"})
 				flusher.Flush()
 				return
 			}
 		case err, ok := <-stream.Err:
 			if ok && err != nil && !shouldIgnoreStreamError(r, err) {
-				transporthttp.WriteSSEJSON(w, "error", map[string]any{
+				httpio.WriteSSEJSON(w, "error", map[string]any{
 					"type": "error",
-					"error": wire.Error{
+					"error": Error{
 						Type:    "api_error",
 						Message: err.Error(),
 					},
@@ -267,27 +252,27 @@ func shouldIgnoreStreamError(r *http.Request, err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "context canceled")
 }
 
-func anthropicContentBlockFromPart(part llm.ContentPart) wire.ContentBlock {
+func anthropicContentBlockFromPart(part llm.ContentPart) ContentBlock {
 	blocks := llmContentToAnthropic([]llm.ContentPart{part})
 	if len(blocks) == 0 {
-		return wire.ContentBlock{Type: "text", Text: ""}
+		return ContentBlock{Type: "text", Text: ""}
 	}
 	return blocks[0]
 }
 
-func llmContentToAnthropic(parts []llm.ContentPart) []wire.ContentBlock {
-	out := make([]wire.ContentBlock, 0, len(parts))
+func llmContentToAnthropic(parts []llm.ContentPart) []ContentBlock {
+	out := make([]ContentBlock, 0, len(parts))
 	for _, part := range parts {
 		switch part.Type {
 		case llm.ContentTypeText, llm.ContentTypeReasoning:
-			out = append(out, wire.ContentBlock{Type: "text", Text: part.Text})
+			out = append(out, ContentBlock{Type: "text", Text: part.Text})
 		case llm.ContentTypeImage:
 			if part.URL != "" {
 				continue
 			}
-			out = append(out, wire.ContentBlock{
+			out = append(out, ContentBlock{
 				Type: "image",
-				Source: &wire.ImageSource{
+				Source: &ImageSource{
 					Type:      "base64",
 					MediaType: part.MediaType,
 					Data:      part.Data,
@@ -298,17 +283,17 @@ func llmContentToAnthropic(parts []llm.ContentPart) []wire.ContentBlock {
 			if part.Input != "" {
 				_ = json.Unmarshal([]byte(part.Input), &input)
 			}
-			out = append(out, wire.ContentBlock{
+			out = append(out, ContentBlock{
 				Type:  "tool_use",
 				ID:    part.ToolCallID,
 				Name:  part.Name,
 				Input: input,
 			})
 		case llm.ContentTypeToolResult:
-			out = append(out, wire.ContentBlock{
+			out = append(out, ContentBlock{
 				Type:      "tool_result",
 				ToolUseID: part.ToolCallID,
-				Content: []wire.ContentBlock{{
+				Content: []ContentBlock{{
 					Type: "text",
 					Text: part.Output,
 				}},

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jiayx/llmio/internal/clients"
 	"github.com/jiayx/llmio/internal/llm"
+	"github.com/jiayx/llmio/internal/protocols"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
 )
@@ -64,10 +64,10 @@ func TestExecutePassthroughUsesBreakerAfterRetryableFailures(t *testing.T) {
 			{ProviderName: "secondary", BackendModel: "b"},
 		},
 	}
-	meta := clients.RequestMeta{
-		Protocol:      clients.ProtocolOpenAI,
-		APIType:       clients.APIChatCompletions,
-		Path:          "/chat/completions",
+	meta := protocols.RequestMeta{
+		Protocol:      protocols.ProtocolOpenAI,
+		APIType:       protocols.APIChatCompletions,
+		UpstreamPath:  "/chat/completions",
 		ExternalModel: "proxy",
 		Body:          []byte(`{"model":"proxy"}`),
 		Headers:       http.Header{},
@@ -119,7 +119,7 @@ func (p policyStubProvider) ChatStream(context.Context, llm.ChatRequest) (*provi
 }
 
 func (p *policyStubProvider) SupportsPassthrough(protocol, apiType string) bool {
-	return protocol == clients.ProtocolOpenAI && apiType == clients.APIChatCompletions
+	return protocol == protocols.ProtocolOpenAI && apiType == protocols.APIChatCompletions
 }
 
 func (p *policyStubProvider) Forward(_ context.Context, _, _ string, _ []byte, _ http.Header) (*http.Response, error) {

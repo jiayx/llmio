@@ -1,15 +1,39 @@
-package transporthttp
+package httpio
 
 import (
 	"bufio"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
 
+// WriteJSON writes a JSON response with the given status.
+func WriteJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// WriteSSE writes one SSE frame.
+func WriteSSE(w io.Writer, event, data string) {
+	if event != "" {
+		_, _ = fmt.Fprintf(w, "event: %s\n", event)
+	}
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+// WriteSSEJSON marshals one SSE frame payload as JSON.
+func WriteSSEJSON(w io.Writer, event string, v any) {
+	data, _ := json.Marshal(v)
+	WriteSSE(w, event, string(data))
+}
+
 // WritePassthroughResponse proxies an upstream response, allowing protocol-specific body rewriting.
 func WritePassthroughResponse(w http.ResponseWriter, resp *http.Response, rewrite func([]byte) ([]byte, error)) {
-	defer Close("passthrough response", resp.Body)
+	defer closeResponse("passthrough response", resp.Body)
 	copyPassthroughHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
@@ -19,6 +43,15 @@ func WritePassthroughResponse(w http.ResponseWriter, resp *http.Response, rewrit
 	}
 
 	rewritePassthroughJSON(w, resp.Body, rewrite)
+}
+
+func closeResponse(scope string, body io.Closer) {
+	if body == nil {
+		return
+	}
+	if err := body.Close(); err != nil {
+		slog.Warn("close response body", "scope", scope, "err", err)
+	}
 }
 
 func copyPassthroughHeaders(dst, src http.Header) {

@@ -7,11 +7,10 @@ import (
 	"strings"
 
 	"github.com/jiayx/llmio/internal/llm"
-	wire "github.com/jiayx/llmio/internal/wire/anthropic"
 )
 
 // MessagesRequestToLLM normalizes one Anthropic messages request into the internal LLM model.
-func MessagesRequestToLLM(req wire.MessagesRequest) (llm.ChatRequest, error) {
+func MessagesRequestToLLM(req MessagesRequest) (llm.ChatRequest, error) {
 	out := llm.ChatRequest{
 		Model:       req.Model,
 		Messages:    make([]llm.Message, 0, len(req.Messages)),
@@ -46,14 +45,14 @@ func MessagesRequestToLLM(req wire.MessagesRequest) (llm.ChatRequest, error) {
 }
 
 // MessagesResponseFromLLM encodes one internal response as an Anthropic messages payload.
-func MessagesResponseFromLLM(externalModel string, resp *llm.ChatResponse) wire.MessagesResponse {
+func MessagesResponseFromLLM(externalModel string, resp *llm.ChatResponse) MessagesResponse {
 	parts := resp.EffectiveOutput()
-	out := wire.MessagesResponse{
+	out := MessagesResponse{
 		ID:    resp.ID,
 		Type:  "message",
 		Role:  "assistant",
 		Model: externalModel,
-		Usage: wire.Usage{
+		Usage: Usage{
 			InputTokens:  resp.InputTokens,
 			OutputTokens: resp.OutputTokens,
 		},
@@ -86,7 +85,7 @@ func normalizeAnthropicContent(content any) ([]llm.ContentPart, error) {
 	}
 }
 
-func anthropicToolsToLLM(tools []wire.ToolDefinition) []llm.ToolDefinition {
+func anthropicToolsToLLM(tools []ToolDefinition) []llm.ToolDefinition {
 	out := make([]llm.ToolDefinition, 0, len(tools))
 	for _, tool := range tools {
 		schema, _ := json.Marshal(tool.InputSchema)

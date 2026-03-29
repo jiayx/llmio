@@ -10,56 +10,28 @@ import (
 	"strings"
 	"time"
 
-	clientmeta "github.com/jiayx/llmio/internal/clients"
 	"github.com/jiayx/llmio/internal/llm"
+	httpio "github.com/jiayx/llmio/internal/protocols/httpio"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
-	transporthttp "github.com/jiayx/llmio/internal/transport/http"
-	wire "github.com/jiayx/llmio/internal/wire/openai"
 )
 
 // DecodeChatCompletionRequest decodes a chat completions request body.
-func DecodeChatCompletionRequest(body []byte) (wire.ChatCompletionRequest, error) {
-	var req wire.ChatCompletionRequest
+func DecodeChatCompletionRequest(body []byte) (ChatCompletionRequest, error) {
+	var req ChatCompletionRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		return wire.ChatCompletionRequest{}, fmt.Errorf("invalid json: %w", err)
+		return ChatCompletionRequest{}, fmt.Errorf("invalid json: %w", err)
 	}
 	return req, nil
 }
 
 // DecodeResponsesRequest decodes a responses request body.
-func DecodeResponsesRequest(body []byte) (wire.ResponsesRequest, error) {
-	var req wire.ResponsesRequest
+func DecodeResponsesRequest(body []byte) (ResponsesRequest, error) {
+	var req ResponsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		return wire.ResponsesRequest{}, fmt.Errorf("invalid json: %w", err)
+		return ResponsesRequest{}, fmt.Errorf("invalid json: %w", err)
 	}
 	return req, nil
-}
-
-// NewChatCompletionRequestMeta describes an inbound OpenAI chat completions request.
-func NewChatCompletionRequestMeta(req wire.ChatCompletionRequest, body []byte, headers http.Header) clientmeta.RequestMeta {
-	return clientmeta.RequestMeta{
-		Protocol:      clientmeta.ProtocolOpenAI,
-		APIType:       clientmeta.APIChatCompletions,
-		Path:          "/chat/completions",
-		ExternalModel: req.Model,
-		Body:          body,
-		Headers:       headers,
-		Stream:        req.Stream,
-	}
-}
-
-// NewResponsesRequestMeta describes an inbound OpenAI responses request.
-func NewResponsesRequestMeta(req wire.ResponsesRequest, body []byte, headers http.Header) clientmeta.RequestMeta {
-	return clientmeta.RequestMeta{
-		Protocol:      clientmeta.ProtocolOpenAI,
-		APIType:       clientmeta.APIResponses,
-		Path:          "/responses",
-		ExternalModel: req.Model,
-		Body:          body,
-		Headers:       headers,
-		Stream:        req.Stream,
-	}
 }
 
 // WriteError writes an OpenAI-style error response.
@@ -70,8 +42,8 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 		"error_type", "invalid_request_error",
 		"message", message,
 	)
-	transporthttp.WriteJSON(w, status, wire.ChatCompletionResponse{
-		Error: &wire.CompletionError{
+	httpio.WriteJSON(w, status, ChatCompletionResponse{
+		Error: &CompletionError{
 			Message: message,
 			Type:    "invalid_request_error",
 		},
@@ -80,15 +52,15 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 
 // WriteModels writes the OpenAI model inventory response.
 func WriteModels(w http.ResponseWriter, infos []routing.ModelInfo) {
-	models := make([]wire.ModelInfo, 0, len(infos))
+	models := make([]ModelInfo, 0, len(infos))
 	for _, info := range infos {
-		models = append(models, wire.ModelInfo{
+		models = append(models, ModelInfo{
 			ID:      info.ID,
 			Object:  "model",
 			OwnedBy: info.OwnedBy,
 		})
 	}
-	transporthttp.WriteJSON(w, http.StatusOK, wire.ModelsResponse{
+	httpio.WriteJSON(w, http.StatusOK, ModelsResponse{
 		Object: "list",
 		Data:   models,
 	})
@@ -98,12 +70,12 @@ func WriteModels(w http.ResponseWriter, infos []routing.ModelInfo) {
 func WriteChatCompletionResponse(w http.ResponseWriter, externalModel string, resp *llm.ChatResponse) {
 	parts := resp.EffectiveOutput()
 	content, toolCalls := llmContentToOpenAI(parts)
-	transporthttp.WriteJSON(w, http.StatusOK, wire.ChatCompletionResponse{
+	httpio.WriteJSON(w, http.StatusOK, ChatCompletionResponse{
 		ID:      resp.ID,
 		Object:  "chat.completion",
 		Model:   externalModel,
-		Choices: []wire.Choice{{Index: 0, Message: wire.Message{Role: "assistant", Content: content, ToolCalls: toolCalls}, FinishReason: resp.FinishReason}},
-		Usage: &wire.CompletionUsage{
+		Choices: []Choice{{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls}, FinishReason: resp.FinishReason}},
+		Usage: &CompletionUsage{
 			PromptTokens:     resp.InputTokens,
 			CompletionTokens: resp.OutputTokens,
 			TotalTokens:      resp.InputTokens + resp.OutputTokens,
@@ -114,7 +86,7 @@ func WriteChatCompletionResponse(w http.ResponseWriter, externalModel string, re
 // WriteResponsesResponse writes one normalized response as OpenAI responses JSON.
 func WriteResponsesResponse(w http.ResponseWriter, externalModel string, resp *llm.ChatResponse) {
 	parts := resp.EffectiveOutput()
-	transporthttp.WriteJSON(w, http.StatusOK, wire.ResponsesResponse{
+	httpio.WriteJSON(w, http.StatusOK, ResponsesResponse{
 		ID:         resp.ID,
 		Object:     "response",
 		CreatedAt:  time.Now().Unix(),
@@ -122,7 +94,7 @@ func WriteResponsesResponse(w http.ResponseWriter, externalModel string, resp *l
 		Status:     "completed",
 		Output:     responseOutputItems(parts),
 		OutputText: resp.OutputText,
-		Usage: &wire.ResponseUsage{
+		Usage: &ResponseUsage{
 			InputTokens:  resp.InputTokens,
 			OutputTokens: resp.OutputTokens,
 			TotalTokens:  resp.InputTokens + resp.OutputTokens,
@@ -132,7 +104,7 @@ func WriteResponsesResponse(w http.ResponseWriter, externalModel string, resp *l
 
 // WritePassthroughResponse rewrites an upstream OpenAI response back to the external model name.
 func WritePassthroughResponse(w http.ResponseWriter, resp *http.Response, externalModel string) {
-	transporthttp.WritePassthroughResponse(w, resp, func(data []byte) ([]byte, error) {
+	httpio.WritePassthroughResponse(w, resp, func(data []byte) ([]byte, error) {
 		return rewritePassthroughJSONPayload(data, externalModel)
 	})
 }
@@ -159,18 +131,18 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 		select {
 		case event, ok := <-stream.Events:
 			if !ok {
-				transporthttp.WriteSSE(w, "", "[DONE]")
+				httpio.WriteSSE(w, "", "[DONE]")
 				flusher.Flush()
 				return
 			}
 			switch event.Type {
 			case llm.StreamEventDelta:
-				chunk := wire.StreamChunk{
+				chunk := StreamChunk{
 					Object: "chat.completion.chunk",
 					Model:  externalModel,
-					Choices: []wire.StreamChoice{{
+					Choices: []StreamChoice{{
 						Index: 0,
-						Delta: wire.StreamDelta{},
+						Delta: StreamDelta{},
 					}},
 				}
 				if event.Part.Type == llm.ContentTypeReasoning {
@@ -178,21 +150,21 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 				} else {
 					chunk.Choices[0].Delta.Content = event.TextDelta
 				}
-				transporthttp.WriteSSEJSON(w, "", chunk)
+				httpio.WriteSSEJSON(w, "", chunk)
 				flusher.Flush()
 			case llm.StreamEventTool:
 				key, state := upsertStreamToolState(toolStates, &toolOrder, event)
-				chunk := wire.StreamChunk{
+				chunk := StreamChunk{
 					Object: "chat.completion.chunk",
 					Model:  externalModel,
-					Choices: []wire.StreamChoice{{
+					Choices: []StreamChoice{{
 						Index: 0,
-						Delta: wire.StreamDelta{
-							ToolCalls: []wire.ToolCall{{
+						Delta: StreamDelta{
+							ToolCalls: []ToolCall{{
 								Index: state.Index,
 								ID:    state.ID,
 								Type:  "function",
-								Function: wire.FunctionCall{
+								Function: FunctionCall{
 									Name:      state.Name,
 									Arguments: event.ToolInput,
 								},
@@ -201,28 +173,28 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 					}},
 				}
 				if key != "" {
-					transporthttp.WriteSSEJSON(w, "", chunk)
+					httpio.WriteSSEJSON(w, "", chunk)
 					flusher.Flush()
 				}
 			case llm.StreamEventStop:
-				chunk := wire.StreamChunk{
+				chunk := StreamChunk{
 					Object: "chat.completion.chunk",
 					Model:  externalModel,
-					Choices: []wire.StreamChoice{{
+					Choices: []StreamChoice{{
 						Index:        0,
-						Delta:        wire.StreamDelta{},
+						Delta:        StreamDelta{},
 						FinishReason: event.FinishReason,
 					}},
 				}
-				transporthttp.WriteSSEJSON(w, "", chunk)
-				transporthttp.WriteSSE(w, "", "[DONE]")
+				httpio.WriteSSEJSON(w, "", chunk)
+				httpio.WriteSSE(w, "", "[DONE]")
 				flusher.Flush()
 				return
 			}
 		case err, ok := <-stream.Err:
 			if ok && err != nil && !shouldIgnoreStreamError(r, err) {
 				slog.Error("stream failed", "protocol", "openai", "api_type", "chat_completions", "err", err)
-				transporthttp.WriteSSE(w, "", "[DONE]")
+				httpio.WriteSSE(w, "", "[DONE]")
 				flusher.Flush()
 			}
 			return
@@ -245,11 +217,11 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	transporthttp.WriteSSEJSON(w, "response.created", wire.ResponsesResponse{
+	httpio.WriteSSEJSON(w, "response.created", ResponsesResponse{
 		Object: "response",
 		Model:  externalModel,
 		Status: "in_progress",
-		Output: []wire.ResponseOutputItem{},
+		Output: []ResponseOutputItem{},
 	})
 	flusher.Flush()
 
@@ -266,13 +238,13 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 		select {
 		case event, ok := <-stream.Events:
 			if !ok {
-				transporthttp.WriteSSEJSON(w, "response.completed", wire.ResponsesResponse{
+				httpio.WriteSSEJSON(w, "response.completed", ResponsesResponse{
 					Object:     "response",
 					Model:      externalModel,
 					Status:     "completed",
 					Output:     responseOutputItems(streamResponseParts(output.String(), reasoning.String(), imageBlocks, imageOrder, toolStates, toolOrder)),
 					OutputText: output.String(),
-					Usage: &wire.ResponseUsage{
+					Usage: &ResponseUsage{
 						InputTokens:  inputTokens,
 						OutputTokens: outputTokens,
 						TotalTokens:  inputTokens + outputTokens,
@@ -287,14 +259,14 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 				if event.Part.Type == llm.ContentTypeImage {
 					imageBlocks[event.BlockIndex] = event.Part
 					imageOrder = append(imageOrder, event.BlockIndex)
-					transporthttp.WriteSSEJSON(w, "response.output_item.added", map[string]any{
+					httpio.WriteSSEJSON(w, "response.output_item.added", map[string]any{
 						"type":  "response.output_item.added",
 						"index": event.BlockIndex,
-						"item": wire.ResponseOutputItem{
+						"item": ResponseOutputItem{
 							Type:   "message",
 							Role:   "assistant",
 							Status: "in_progress",
-							Content: []wire.ResponseContentPart{{
+							Content: []ResponseContentPart{{
 								Type:     "input_image",
 								ImageURL: event.Part.URL,
 							}},
@@ -305,13 +277,13 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 			case llm.StreamEventDelta:
 				if event.Part.Type == llm.ContentTypeReasoning {
 					reasoning.WriteString(event.TextDelta)
-					transporthttp.WriteSSEJSON(w, "response.reasoning.delta", map[string]any{
+					httpio.WriteSSEJSON(w, "response.reasoning.delta", map[string]any{
 						"type":  "response.reasoning.delta",
 						"delta": event.TextDelta,
 					})
 				} else {
 					output.WriteString(event.TextDelta)
-					transporthttp.WriteSSEJSON(w, "response.output_text.delta", map[string]any{
+					httpio.WriteSSEJSON(w, "response.output_text.delta", map[string]any{
 						"type":  "response.output_text.delta",
 						"delta": event.TextDelta,
 					})
@@ -320,14 +292,14 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 			case llm.StreamEventTool:
 				key, state := upsertStreamToolState(toolStates, &toolOrder, event)
 				if !state.Emitted {
-					transporthttp.WriteSSEJSON(w, "response.output_item.added", map[string]any{
+					httpio.WriteSSEJSON(w, "response.output_item.added", map[string]any{
 						"type":  "response.output_item.added",
-						"item":  wire.ResponseOutputItem{Type: "function_call", Name: state.Name, CallID: state.ID, Status: "in_progress"},
+						"item":  ResponseOutputItem{Type: "function_call", Name: state.Name, CallID: state.ID, Status: "in_progress"},
 						"index": state.Index,
 					})
 					state.Emitted = true
 				}
-				transporthttp.WriteSSEJSON(w, "response.function_call_arguments.delta", map[string]any{
+				httpio.WriteSSEJSON(w, "response.function_call_arguments.delta", map[string]any{
 					"type":         "response.function_call_arguments.delta",
 					"call_id":      state.ID,
 					"name":         state.Name,
@@ -340,14 +312,14 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 			case llm.StreamEventContentStop:
 				if event.Part.Type == llm.ContentTypeImage {
 					part := imageBlocks[event.BlockIndex]
-					transporthttp.WriteSSEJSON(w, "response.output_item.done", map[string]any{
+					httpio.WriteSSEJSON(w, "response.output_item.done", map[string]any{
 						"type":  "response.output_item.done",
 						"index": event.BlockIndex,
-						"item": wire.ResponseOutputItem{
+						"item": ResponseOutputItem{
 							Type:   "message",
 							Role:   "assistant",
 							Status: "completed",
-							Content: []wire.ResponseContentPart{{
+							Content: []ResponseContentPart{{
 								Type:     "input_image",
 								ImageURL: part.URL,
 							}},
@@ -359,22 +331,22 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 				inputTokens = event.InputTokens
 				outputTokens = event.OutputTokens
 			case llm.StreamEventStop:
-				transporthttp.WriteSSEJSON(w, "response.output_text.done", map[string]any{
+				httpio.WriteSSEJSON(w, "response.output_text.done", map[string]any{
 					"type": "response.output_text.done",
 					"text": output.String(),
 				})
 				if reasoning.Len() > 0 {
-					transporthttp.WriteSSEJSON(w, "response.reasoning.done", map[string]any{
+					httpio.WriteSSEJSON(w, "response.reasoning.done", map[string]any{
 						"type": "response.reasoning.done",
 						"text": reasoning.String(),
 					})
 				}
 				for _, key := range toolOrder {
 					state := toolStates[key]
-					transporthttp.WriteSSEJSON(w, "response.output_item.done", map[string]any{
+					httpio.WriteSSEJSON(w, "response.output_item.done", map[string]any{
 						"type":  "response.output_item.done",
 						"index": state.Index,
-						"item": wire.ResponseOutputItem{
+						"item": ResponseOutputItem{
 							Type:      "function_call",
 							Name:      state.Name,
 							CallID:    state.ID,
@@ -383,13 +355,13 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 						},
 					})
 				}
-				transporthttp.WriteSSEJSON(w, "response.completed", wire.ResponsesResponse{
+				httpio.WriteSSEJSON(w, "response.completed", ResponsesResponse{
 					Object:     "response",
 					Model:      externalModel,
 					Status:     "completed",
 					Output:     responseOutputItems(streamResponseParts(output.String(), reasoning.String(), imageBlocks, imageOrder, toolStates, toolOrder)),
 					OutputText: output.String(),
-					Usage: &wire.ResponseUsage{
+					Usage: &ResponseUsage{
 						InputTokens:  inputTokens,
 						OutputTokens: outputTokens,
 						TotalTokens:  inputTokens + outputTokens,
@@ -422,29 +394,29 @@ func rewriteMapModel(m map[string]any, model string) {
 	}
 }
 
-func responseOutputItems(parts []llm.ContentPart) []wire.ResponseOutputItem {
+func responseOutputItems(parts []llm.ContentPart) []ResponseOutputItem {
 	if len(parts) == 0 {
 		return nil
 	}
-	var items []wire.ResponseOutputItem
-	var messageParts []wire.ResponseContentPart
+	var items []ResponseOutputItem
+	var messageParts []ResponseContentPart
 	for _, part := range parts {
 		switch part.Type {
 		case llm.ContentTypeText:
-			messageParts = append(messageParts, wire.ResponseContentPart{Type: "output_text", Text: part.Text})
+			messageParts = append(messageParts, ResponseContentPart{Type: "output_text", Text: part.Text})
 		case llm.ContentTypeImage:
-			messageParts = append(messageParts, wire.ResponseContentPart{Type: "input_image", ImageURL: part.URL})
+			messageParts = append(messageParts, ResponseContentPart{Type: "input_image", ImageURL: part.URL})
 		case llm.ContentTypeReasoning:
-			items = append(items, wire.ResponseOutputItem{
+			items = append(items, ResponseOutputItem{
 				Type:   "reasoning",
 				Status: "completed",
-				Content: []wire.ResponseContentPart{{
+				Content: []ResponseContentPart{{
 					Type: "output_text",
 					Text: part.Text,
 				}},
 			})
 		case llm.ContentTypeToolCall:
-			items = append(items, wire.ResponseOutputItem{
+			items = append(items, ResponseOutputItem{
 				Type:      "function_call",
 				Name:      part.Name,
 				CallID:    part.ToolCallID,
@@ -454,7 +426,7 @@ func responseOutputItems(parts []llm.ContentPart) []wire.ResponseOutputItem {
 		}
 	}
 	if len(messageParts) > 0 {
-		items = append([]wire.ResponseOutputItem{{
+		items = append([]ResponseOutputItem{{
 			Type:    "message",
 			Role:    "assistant",
 			Status:  "completed",
@@ -464,9 +436,9 @@ func responseOutputItems(parts []llm.ContentPart) []wire.ResponseOutputItem {
 	return items
 }
 
-func llmContentToOpenAI(parts []llm.ContentPart) (any, []wire.ToolCall) {
+func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall) {
 	var content []map[string]any
-	var toolCalls []wire.ToolCall
+	var toolCalls []ToolCall
 	for _, part := range parts {
 		switch part.Type {
 		case llm.ContentTypeText:
@@ -476,10 +448,10 @@ func llmContentToOpenAI(parts []llm.ContentPart) (any, []wire.ToolCall) {
 				content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
 			}
 		case llm.ContentTypeToolCall:
-			toolCalls = append(toolCalls, wire.ToolCall{
+			toolCalls = append(toolCalls, ToolCall{
 				ID:   part.ToolCallID,
 				Type: "function",
-				Function: wire.FunctionCall{
+				Function: FunctionCall{
 					Name:      part.Name,
 					Arguments: part.Input,
 				},

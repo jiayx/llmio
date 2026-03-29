@@ -10,13 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	anthropicclient "github.com/jiayx/llmio/internal/clients/anthropic"
-	openaiclient "github.com/jiayx/llmio/internal/clients/openai"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
+	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
+	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
-	anthropicproto "github.com/jiayx/llmio/internal/wire/anthropic"
-	openaiproto "github.com/jiayx/llmio/internal/wire/openai"
+	"github.com/jiayx/llmio/internal/routing"
 )
 
 func TestAnthropicToLLM(t *testing.T) {
@@ -37,7 +36,7 @@ func TestAnthropicToLLM(t *testing.T) {
 		},
 	}
 
-	got, err := anthropicclient.MessagesRequestToLLM(req)
+	got, err := anthropicproto.MessagesRequestToLLM(req)
 	if err != nil {
 		t.Fatalf("MessagesRequestToLLM() error = %v", err)
 	}
@@ -56,7 +55,7 @@ func TestAnthropicToLLM(t *testing.T) {
 }
 
 func TestLLMResponseToAnthropic(t *testing.T) {
-	got := anthropicclient.MessagesResponseFromLLM("claude-compatible", &llm.ChatResponse{
+	got := anthropicproto.MessagesResponseFromLLM("claude-compatible", &llm.ChatResponse{
 		ID:           "chatcmpl-1",
 		Model:        "deepseek-chat",
 		OutputText:   "world",
@@ -142,7 +141,7 @@ func TestOpenAIRequestToLLM(t *testing.T) {
 		User:      "u1",
 	}
 
-	got, err := openaiclient.ChatCompletionRequestToLLM(req)
+	got, err := openaiproto.ChatCompletionRequestToLLM(req)
 	if err != nil {
 		t.Fatalf("ChatCompletionRequestToLLM() error = %v", err)
 	}
@@ -155,7 +154,7 @@ func TestOpenAIRequestToLLM(t *testing.T) {
 }
 
 func TestOpenAIRequestToLLMRejectsUnsupportedContent(t *testing.T) {
-	_, err := openaiclient.ChatCompletionRequestToLLM(openaiproto.ChatCompletionRequest{
+	_, err := openaiproto.ChatCompletionRequestToLLM(openaiproto.ChatCompletionRequest{
 		Model: "gpt-proxy",
 		Messages: []openaiproto.Message{{
 			Role: "user",
@@ -171,7 +170,7 @@ func TestOpenAIRequestToLLMRejectsUnsupportedContent(t *testing.T) {
 
 func TestWriteLLMResponseAsOpenAI(t *testing.T) {
 	rec := httptest.NewRecorder()
-	openaiclient.WriteChatCompletionResponse(rec, "gpt-proxy", &llm.ChatResponse{
+	openaiproto.WriteChatCompletionResponse(rec, "gpt-proxy", &llm.ChatResponse{
 		ID:           "1",
 		OutputText:   "hello",
 		FinishReason: "stop",
@@ -210,7 +209,7 @@ func TestOpenAIResponsesRequestToLLM(t *testing.T) {
 		},
 	}
 
-	got, err := openaiclient.ResponsesRequestToLLM(req)
+	got, err := openaiproto.ResponsesRequestToLLM(req)
 	if err != nil {
 		t.Fatalf("ResponsesRequestToLLM() error = %v", err)
 	}
@@ -243,7 +242,7 @@ func TestOpenAIResponsesRequestToLLMFunctionCallOutput(t *testing.T) {
 		},
 	}
 
-	got, err := openaiclient.ResponsesRequestToLLM(req)
+	got, err := openaiproto.ResponsesRequestToLLM(req)
 	if err != nil {
 		t.Fatalf("ResponsesRequestToLLM() error = %v", err)
 	}
@@ -259,7 +258,7 @@ func TestOpenAIResponsesRequestToLLMFunctionCallOutput(t *testing.T) {
 }
 
 func TestLLMResponseToOpenAIResponse(t *testing.T) {
-	got := openaiclient.ResponsesResponseFromLLM("gpt-proxy", &llm.ChatResponse{
+	got := openaiproto.ResponsesResponseFromLLM("gpt-proxy", &llm.ChatResponse{
 		ID:           "resp_1",
 		OutputText:   "hello",
 		InputTokens:  10,
@@ -289,11 +288,9 @@ func TestHandleOpenAIResponses(t *testing.T) {
 				OutputTokens: 4,
 			}},
 		},
-		models: map[string]modelRoute{
-			"gpt-proxy": {
-				Targets: []routeTarget{{ProviderName: "primary", BackendModel: "backend-model"}},
-			},
-		},
+		router: mustTestRouter(t, map[string]chatProvider{
+			"primary": fakeProvider{},
+		}, "gpt-proxy", "primary", "backend-model"),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
@@ -347,7 +344,7 @@ func TestAnthropicToLLMToolAndImage(t *testing.T) {
 		},
 	}
 
-	got, err := anthropicclient.MessagesRequestToLLM(req)
+	got, err := anthropicproto.MessagesRequestToLLM(req)
 	if err != nil {
 		t.Fatalf("MessagesRequestToLLM() error = %v", err)
 	}
@@ -392,7 +389,7 @@ func TestOpenAIRequestToLLMToolCalls(t *testing.T) {
 		}},
 	}
 
-	got, err := openaiclient.ChatCompletionRequestToLLM(req)
+	got, err := openaiproto.ChatCompletionRequestToLLM(req)
 	if err != nil {
 		t.Fatalf("ChatCompletionRequestToLLM() error = %v", err)
 	}
@@ -447,9 +444,7 @@ func TestHandleOpenAIChatCompletionsPassthrough(t *testing.T) {
 	}
 	s := &Server{
 		providers: map[string]chatProvider{"p": p},
-		models: map[string]modelRoute{
-			"gpt-proxy": {Targets: []routeTarget{{ProviderName: "p", BackendModel: "backend-model"}}},
-		},
+		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "gpt-proxy", "p", "backend-model"),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-proxy","messages":[{"role":"user","content":"hello"}]}`))
@@ -486,9 +481,7 @@ func TestHandleOpenAIResponsesPassthrough(t *testing.T) {
 	}
 	s := &Server{
 		providers: map[string]chatProvider{"p": p},
-		models: map[string]modelRoute{
-			"gpt-proxy": {Targets: []routeTarget{{ProviderName: "p", BackendModel: "backend-model"}}},
-		},
+		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "gpt-proxy", "p", "backend-model"),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-proxy","input":"hello"}`))
@@ -517,9 +510,7 @@ func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 	}
 	s := &Server{
 		providers: map[string]chatProvider{"p": p},
-		models: map[string]modelRoute{
-			"gpt-proxy": {Targets: []routeTarget{{ProviderName: "p", BackendModel: "backend-model"}}},
-		},
+		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "gpt-proxy", "p", "backend-model"),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-proxy","input":"hello"}`))
@@ -542,35 +533,6 @@ func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 	}
 	if body.OutputText != "fallback" {
 		t.Fatalf("body = %#v", body)
-	}
-}
-
-func TestHandlerSupportsRootOpenAIResponsesAlias(t *testing.T) {
-	s := &Server{
-		providers: map[string]chatProvider{
-			"primary": fakeProvider{chatResp: &llm.ChatResponse{
-				ID:           "resp_1",
-				OutputText:   "world",
-				InputTokens:  3,
-				OutputTokens: 4,
-			}},
-		},
-		models: map[string]modelRoute{
-			"gpt-proxy": {
-				Targets: []routeTarget{{ProviderName: "primary", BackendModel: "backend-model"}},
-			},
-		},
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{
-		"model": "gpt-proxy",
-		"input": "hello"
-	}`))
-	rec := httptest.NewRecorder()
-
-	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -612,9 +574,7 @@ func TestHandleAnthropicMessagesPassthrough(t *testing.T) {
 	}
 	s := &Server{
 		providers: map[string]chatProvider{"p": p},
-		models: map[string]modelRoute{
-			"claude-proxy": {Targets: []routeTarget{{ProviderName: "p", BackendModel: "backend-model"}}},
-		},
+		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "claude-proxy", "p", "backend-model"),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"claude-proxy","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`))
@@ -646,7 +606,7 @@ func TestWritePassthroughResponseSSEModelRewrite(t *testing.T) {
 		Body: io.NopCloser(strings.NewReader("event: message\ndata: {\"model\":\"backend-model\"}\n\ndata: [DONE]\n\n")),
 	}
 
-	openaiclient.WritePassthroughResponse(rec, resp, "gpt-proxy")
+	openaiproto.WritePassthroughResponse(rec, resp, "gpt-proxy")
 	body := rec.Body.String()
 	if !strings.Contains(body, `"model":"gpt-proxy"`) {
 		t.Fatalf("body = %s", body)
@@ -803,9 +763,7 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 	s := &Server{
 		apiKeys:   map[string]struct{}{},
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-		models: map[string]modelRoute{
-			"claude-proxy": {Targets: []routeTarget{{ProviderName: "p", BackendModel: "x"}}},
-		},
+		router:    mustTestRouter(t, map[string]chatProvider{"p": fakeProvider{}}, "claude-proxy", "p", "x"),
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{
@@ -948,4 +906,22 @@ func (f *fakePassthroughProvider) Forward(ctx context.Context, protocol, path st
 	default:
 		return nil, errors.New("unsupported protocol")
 	}
+}
+
+func mustTestRouter(t *testing.T, providers map[string]chatProvider, externalModel, providerName, backendModel string) *routing.Router {
+	t.Helper()
+
+	router, err := routing.New(&config.Config{
+		ModelRoutes: []config.ModelRoute{{
+			ExternalModel: externalModel,
+			Targets: []config.Target{{
+				Provider:     providerName,
+				BackendModel: backendModel,
+			}},
+		}},
+	}, providers)
+	if err != nil {
+		t.Fatalf("routing.New() error = %v", err)
+	}
+	return router
 }

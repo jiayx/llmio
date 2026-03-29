@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiayx/llmio/internal/clients"
 	"github.com/jiayx/llmio/internal/llm"
+	protocols "github.com/jiayx/llmio/internal/protocols"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
 )
@@ -139,7 +139,7 @@ func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm
 }
 
 // ExecutePassthrough attempts native forwarding and falls back when only retryable failures occur.
-func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, meta clients.RequestMeta) (*http.Response, bool, error) {
+func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, meta protocols.RequestMeta) (*http.Response, bool, error) {
 	for _, target := range route.Targets {
 		provider := p.providers[target.ProviderName]
 
@@ -161,7 +161,7 @@ func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, me
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, p.timeoutFor(meta.Stream))
-		resp, err := forwarder.Forward(attemptCtx, meta.Protocol, meta.Path, payload, meta.Headers)
+		resp, err := forwarder.Forward(attemptCtx, meta.Protocol, meta.UpstreamPath, payload, meta.Headers)
 		cancel()
 		if err != nil {
 			p.markFailure(target.ProviderName)
