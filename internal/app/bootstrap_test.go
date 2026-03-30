@@ -11,7 +11,8 @@ func TestBootstrapBuildsApplication(t *testing.T) {
 	configPath := filepath.Join(dir, "llmio.json")
 	if err := os.WriteFile(configPath, []byte(`{
 		"listen": ":9090",
-		"api_keys": ["secret"],
+		"admin_api_keys": ["secret"],
+		"database_path": "./llmio.db",
 		"providers": [
 			{
 				"name": "openai",

@@ -21,9 +21,19 @@ func TestLookupEndpointMatchesCanonicalOpenAIPath(t *testing.T) {
 	}
 }
 
-func TestLookupEndpointRejectsRootOpenAIAlias(t *testing.T) {
-	if _, _, ok := LookupEndpoint(DefaultAdapters(), "/responses"); ok {
-		t.Fatalf("lookup unexpectedly matched root alias")
+func TestLookupEndpointMatchesRootOpenAIAlias(t *testing.T) {
+	adapter, endpoint, ok := LookupEndpoint(DefaultAdapters(), "/responses")
+	if !ok {
+		t.Fatalf("lookup failed")
+	}
+	if adapter.Protocol() != ProtocolOpenAI {
+		t.Fatalf("protocol = %q", adapter.Protocol())
+	}
+	if endpoint.InboundPath != "/responses" {
+		t.Fatalf("endpoint path = %q", endpoint.InboundPath)
+	}
+	if got := endpoint.upstreamPath(); got != "/responses" {
+		t.Fatalf("forward path = %q", got)
 	}
 }
 

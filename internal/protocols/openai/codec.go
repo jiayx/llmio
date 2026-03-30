@@ -47,16 +47,22 @@ func ChatCompletionRequestFromLLM(req llm.ChatRequest) ChatCompletionRequest {
 		maxTokens = &req.MaxTokens
 	}
 
+	var streamOptions *ChatCompletionStreamOptions
+	if req.Stream {
+		streamOptions = &ChatCompletionStreamOptions{IncludeUsage: true}
+	}
+
 	return ChatCompletionRequest{
-		Model:       req.Model,
-		Messages:    messages,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		MaxTokens:   maxTokens,
-		Stream:      req.Stream,
-		User:        req.User,
-		Tools:       llmToolsToOpenAI(req.Tools),
-		ToolChoice:  llmToolChoiceToOpenAI(req.ToolChoice),
+		Model:         req.Model,
+		Messages:      messages,
+		Temperature:   req.Temperature,
+		TopP:          req.TopP,
+		MaxTokens:     maxTokens,
+		Stream:        req.Stream,
+		StreamOptions: streamOptions,
+		User:          req.User,
+		Tools:         llmToolsToOpenAI(req.Tools),
+		ToolChoice:    llmToolChoiceToOpenAI(req.ToolChoice),
 	}
 }
 
@@ -74,6 +80,25 @@ func ChatCompletionResponseToLLM(resp ChatCompletionResponse, raw []byte) *llm.C
 	if len(resp.Choices) > 0 {
 		out.FinishReason = resp.Choices[0].FinishReason
 		out.Output = chatCompletionMessageToLLM(resp.Choices[0].Message)
+		out.OutputText = llm.ExtractText(out.Output)
+	}
+	return out
+}
+
+// ResponsesResponseToLLM decodes one OpenAI responses payload into the internal response model.
+func ResponsesResponseToLLM(resp ResponsesResponse, raw []byte) *llm.ChatResponse {
+	out := &llm.ChatResponse{
+		ID:         resp.ID,
+		Model:      resp.Model,
+		OutputText: resp.OutputText,
+		Raw:        raw,
+	}
+	if resp.Usage != nil {
+		out.InputTokens = resp.Usage.InputTokens
+		out.OutputTokens = resp.Usage.OutputTokens
+	}
+	out.Output = responsesOutputToLLM(resp.Output)
+	if out.OutputText == "" {
 		out.OutputText = llm.ExtractText(out.Output)
 	}
 	return out
@@ -98,11 +123,15 @@ func StreamChunkPayloadToLLMEvents(payload string) ([]llm.StreamEvent, error) {
 				Raw:       raw,
 			})
 		}
-		if choice.Delta.Reasoning != "" {
+		reasoning := choice.Delta.Reasoning
+		if reasoning == "" {
+			reasoning = choice.Delta.ReasoningContent
+		}
+		if reasoning != "" {
 			events = append(events, llm.StreamEvent{
 				Type:      llm.StreamEventDelta,
 				Part:      llm.ContentPart{Type: llm.ContentTypeReasoning},
-				TextDelta: choice.Delta.Reasoning,
+				TextDelta: reasoning,
 				Raw:       raw,
 			})
 		}
@@ -123,6 +152,14 @@ func StreamChunkPayloadToLLMEvents(payload string) ([]llm.StreamEvent, error) {
 			events = append(events, llm.StreamEvent{
 				Type:         llm.StreamEventStop,
 				FinishReason: choice.FinishReason,
+				Raw:          raw,
+			})
+		}
+		if choice.Usage != nil {
+			events = append(events, llm.StreamEvent{
+				Type:         llm.StreamEventUsage,
+				InputTokens:  choice.Usage.PromptTokens,
+				OutputTokens: choice.Usage.CompletionTokens,
 				Raw:          raw,
 			})
 		}
@@ -168,6 +205,37 @@ func chatCompletionMessageToLLM(msg Message) []llm.ContentPart {
 			ToolCallID: call.ID,
 			Input:      call.Function.Arguments,
 		})
+	}
+	return parts
+}
+
+func responsesOutputToLLM(items []ResponseOutputItem) []llm.ContentPart {
+	parts := make([]llm.ContentPart, 0, len(items))
+	for _, item := range items {
+		switch item.Type {
+		case "message":
+			for _, content := range item.Content {
+				switch content.Type {
+				case "output_text", "text":
+					parts = append(parts, llm.ContentPart{Type: llm.ContentTypeText, Text: content.Text})
+				case "input_image":
+					parts = append(parts, llm.ContentPart{Type: llm.ContentTypeImage, URL: content.ImageURL})
+				}
+			}
+		case "function_call":
+			parts = append(parts, llm.ContentPart{
+				Type:       llm.ContentTypeToolCall,
+				Name:       item.Name,
+				ToolCallID: item.CallID,
+				Input:      item.Arguments,
+			})
+		case "function_call_output":
+			parts = append(parts, llm.ContentPart{
+				Type:       llm.ContentTypeToolResult,
+				ToolCallID: item.CallID,
+				Output:     item.OutputData,
+			})
+		}
 	}
 	return parts
 }

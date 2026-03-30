@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/jiayx/llmio/internal/config"
+	"github.com/jiayx/llmio/internal/debugtrace"
 	"github.com/jiayx/llmio/internal/llm"
 	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
@@ -83,6 +85,13 @@ func (p *OpenAICompatible) Chat(ctx context.Context, req llm.ChatRequest) (*llm.
 	if err != nil {
 		return nil, fmt.Errorf("read provider response: %w", err)
 	}
+	if debugtrace.Enabled() {
+		slog.Debug("openai provider response body trace",
+			"provider", p.name,
+			"path", "/chat/completions",
+			"body", debugtrace.Bytes(data),
+		)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s returned status %d: %s", p.name, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
@@ -128,6 +137,7 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		var pendingStop *llm.StreamEvent
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || strings.HasPrefix(line, ":") || !strings.HasPrefix(line, "data:") {
@@ -135,8 +145,19 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 			}
 
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if debugtrace.Enabled() {
+				slog.Debug("openai provider stream chunk trace",
+					"provider", p.name,
+					"path", "/chat/completions",
+					"payload", debugtrace.String(payload),
+				)
+			}
 			if payload == "[DONE]" {
-				events <- llm.StreamEvent{Type: llm.StreamEventStop}
+				if pendingStop != nil {
+					events <- *pendingStop
+				} else {
+					events <- llm.StreamEvent{Type: llm.StreamEventStop}
+				}
 				return
 			}
 
@@ -145,20 +166,32 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 				errs <- err
 				return
 			}
-			stop := false
 			for _, event := range streamEvents {
-				events <- event
-				if event.Type == llm.StreamEventStop {
-					stop = true
+				if debugtrace.Enabled() {
+					slog.Debug("openai provider stream event trace",
+						"provider", p.name,
+						"type", event.Type,
+						"text_delta", debugtrace.String(event.TextDelta),
+						"input_tokens", event.InputTokens,
+						"output_tokens", event.OutputTokens,
+						"finish_reason", event.FinishReason,
+					)
 				}
-			}
-			if stop {
-				return
+				if event.Type == llm.StreamEventStop {
+					stopEvent := event
+					pendingStop = &stopEvent
+					continue
+				}
+				events <- event
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
 			errs <- fmt.Errorf("read openai stream: %w", err)
+			return
+		}
+		if pendingStop != nil {
+			events <- *pendingStop
 		}
 	}()
 

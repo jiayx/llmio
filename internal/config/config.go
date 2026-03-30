@@ -11,10 +11,11 @@ import (
 
 // Config is the top-level gateway configuration loaded from disk.
 type Config struct {
-	Listen      string           `json:"listen"`
-	APIKeys     []string         `json:"api_keys"`
-	Providers   []ProviderConfig `json:"providers"`
-	ModelRoutes []ModelRoute     `json:"model_routes"`
+	Listen       string           `json:"listen"`
+	AdminAPIKeys []string         `json:"admin_api_keys"`
+	DatabasePath string           `json:"database_path"`
+	Providers    []ProviderConfig `json:"providers"`
+	ModelRoutes  []ModelRoute     `json:"model_routes"`
 }
 
 // ProviderConfig defines a backend provider endpoint and its auth settings.
@@ -100,8 +101,14 @@ func Load(path string) (*Config, error) {
 		p.SupportedAPITypes = apiTypes
 	}
 
-	for i := range cfg.APIKeys {
-		cfg.APIKeys[i] = strings.TrimSpace(cfg.APIKeys[i])
+	for i := range cfg.AdminAPIKeys {
+		cfg.AdminAPIKeys[i] = strings.TrimSpace(cfg.AdminAPIKeys[i])
+	}
+	cfg.DatabasePath = strings.TrimSpace(cfg.DatabasePath)
+	if cfg.DatabasePath == "" {
+		cfg.DatabasePath = filepath.Join(filepath.Dir(path), "llmio.db")
+	} else if !filepath.IsAbs(cfg.DatabasePath) {
+		cfg.DatabasePath = filepath.Join(filepath.Dir(path), cfg.DatabasePath)
 	}
 
 	for i := range cfg.ModelRoutes {

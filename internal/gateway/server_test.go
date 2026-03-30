@@ -5,17 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/jiayx/llmio/internal/apikeys"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
+	"github.com/jiayx/llmio/internal/policy"
+	protocols "github.com/jiayx/llmio/internal/protocols"
 	anthropicproto "github.com/jiayx/llmio/internal/protocols/anthropic"
 	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
+	"github.com/jiayx/llmio/internal/usage"
 )
 
 func TestAnthropicToLLM(t *testing.T) {
@@ -78,7 +84,7 @@ func TestLLMResponseToAnthropic(t *testing.T) {
 }
 
 func TestWithAuth(t *testing.T) {
-	s := &Server{apiKeys: map[string]struct{}{"secret": {}}}
+	s := &Server{adminAPIKeys: map[string]apikeys.Principal{"secret": {ID: "admin:secret", Name: "admin"}}}
 	handler := s.withAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -96,6 +102,226 @@ func TestWithAuth(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
+	store, err := apikeys.Open(filepath.Join(t.TempDir(), "apikeys.json"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	providersMap := map[string]chatProvider{
+		"primary": fakeProvider{chatResp: &llm.ChatResponse{
+			ID:           "resp_1",
+			Model:        "backend-model",
+			OutputText:   "hello",
+			InputTokens:  11,
+			OutputTokens: 7,
+		}},
+	}
+	router, err := routing.New(&config.Config{
+		Providers: []config.ProviderConfig{{
+			Name:    "primary",
+			Type:    "openai-compatible",
+			BaseURL: "https://example.com/v1",
+		}},
+		ModelRoutes: []config.ModelRoute{{
+			ExternalModel: "gpt-proxy",
+			Targets: []config.Target{{
+				Provider:     "primary",
+				BackendModel: "backend-model",
+			}},
+		}},
+	}, providersMap)
+	if err != nil {
+		t.Fatalf("routing.New() error = %v", err)
+	}
+
+	s := &Server{
+		adminAPIKeys: map[string]apikeys.Principal{
+			"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
+		},
+		apiKeyStore:      store,
+		providers:        providersMap,
+		router:           router,
+		policy:           policy.NewWithRecorder(policy.DefaultConfig(), providersMap, usage.MultiRecorder{store}),
+		protocolAdapters: protocols.DefaultAdapters(),
+	}
+	handler := s.Handler()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/api-keys", strings.NewReader(`{"name":"crm-system"}`))
+	createReq.Header.Set("Authorization", "Bearer admin-secret")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	var created struct {
+		Key struct {
+			ID string `json:"id"`
+		} `json:"key"`
+		Secret string `json:"secret"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create = %v", err)
+	}
+	if created.Key.ID == "" || created.Secret == "" {
+		t.Fatalf("create body = %s", createRec.Body.String())
+	}
+
+	callReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-proxy","messages":[{"role":"user","content":"hi"}]}`))
+	callReq.Header.Set("Authorization", "Bearer "+created.Secret)
+	callReq.Header.Set("Content-Type", "application/json")
+	callRec := httptest.NewRecorder()
+	handler.ServeHTTP(callRec, callReq)
+	if callRec.Code != http.StatusOK {
+		t.Fatalf("call status = %d body=%s", callRec.Code, callRec.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/admin/api-keys/"+created.Key.ID, nil)
+	getReq.Header.Set("Authorization", "Bearer admin-secret")
+	getRec := httptest.NewRecorder()
+	handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get status = %d body=%s", getRec.Code, getRec.Body.String())
+	}
+
+	var key apikeys.KeySummary
+	if err := json.Unmarshal(getRec.Body.Bytes(), &key); err != nil {
+		t.Fatalf("unmarshal get = %v", err)
+	}
+	if key.Usage.RequestCount != 1 || key.Usage.InputTokens != 11 || key.Usage.OutputTokens != 7 || key.Usage.TotalTokens != 18 {
+		t.Fatalf("usage = %#v", key.Usage)
+	}
+
+	usageReq := httptest.NewRequest(http.MethodGet, "/admin/api-keys/"+created.Key.ID+"/usage", nil)
+	usageReq.Header.Set("Authorization", "Bearer admin-secret")
+	usageRec := httptest.NewRecorder()
+	handler.ServeHTTP(usageRec, usageReq)
+	if usageRec.Code != http.StatusOK {
+		t.Fatalf("usage status = %d body=%s", usageRec.Code, usageRec.Body.String())
+	}
+
+	var singleUsage apikeys.UsageReport
+	if err := json.Unmarshal(usageRec.Body.Bytes(), &singleUsage); err != nil {
+		t.Fatalf("unmarshal usage = %v", err)
+	}
+	if singleUsage.KeyID != created.Key.ID || singleUsage.Usage.TotalTokens != 18 {
+		t.Fatalf("singleUsage = %#v", singleUsage)
+	}
+
+	adminUsageReq := httptest.NewRequest(http.MethodGet, "/admin/usage", nil)
+	adminUsageReq.Header.Set("Authorization", "Bearer admin-secret")
+	adminUsageRec := httptest.NewRecorder()
+	handler.ServeHTTP(adminUsageRec, adminUsageReq)
+	if adminUsageRec.Code != http.StatusOK {
+		t.Fatalf("admin usage status = %d body=%s", adminUsageRec.Code, adminUsageRec.Body.String())
+	}
+
+	var usageList struct {
+		Total apikeys.UsageTotals   `json:"total"`
+		Data  []apikeys.UsageReport `json:"data"`
+	}
+	if err := json.Unmarshal(adminUsageRec.Body.Bytes(), &usageList); err != nil {
+		t.Fatalf("unmarshal usage list = %v", err)
+	}
+	if usageList.Total.TotalTokens != 18 || len(usageList.Data) != 1 || usageList.Data[0].KeyID != created.Key.ID {
+		t.Fatalf("usageList = %#v", usageList)
+	}
+}
+
+func TestDisabledManagedAPIKeyCannotCallLLM(t *testing.T) {
+	store, err := apikeys.Open(filepath.Join(t.TempDir(), "apikeys.json"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	created, err := store.Create("worker")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := store.Disable(created.Key.ID); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+
+	s := &Server{
+		apiKeyStore:      store,
+		protocolAdapters: protocols.DefaultAdapters(),
+	}
+	handler := s.withAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer "+created.Secret)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestRecoveryReturnsJSON500AndLogsPanic(t *testing.T) {
+	var logBuf strings.Builder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(prev)
+
+	s := &Server{}
+	handler := s.withRecovery(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic("boom")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"error":"internal server error"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	if !strings.Contains(logBuf.String(), "request panic") || !strings.Contains(logBuf.String(), "boom") || !strings.Contains(logBuf.String(), "stack=") {
+		t.Fatalf("log = %s", logBuf.String())
+	}
+}
+
+func TestRecoveryReturnsOpenAI500(t *testing.T) {
+	s := &Server{}
+	handler := s.withRecovery(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic("boom")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"message":"internal server error"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestRecoveryReturnsAnthropic500(t *testing.T) {
+	s := &Server{}
+	handler := s.withRecovery(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic("boom")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"error"`) || !strings.Contains(rec.Body.String(), `"message":"internal server error"`) {
+		t.Fatalf("body = %s", rec.Body.String())
 	}
 }
 
@@ -761,7 +987,6 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "end_turn"},
 	)
 	s := &Server{
-		apiKeys:   map[string]struct{}{},
 		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
 		router:    mustTestRouter(t, map[string]chatProvider{"p": fakeProvider{}}, "claude-proxy", "p", "x"),
 	}

@@ -1,6 +1,7 @@
 {
   "listen": ":8080",
-  "api_keys": ["${LLMIO_API_KEY}"],
+  "admin_api_keys": ["${LLMIO_ADMIN_API_KEY}"],
+  "database_path": "./llmio.db",
   "providers": [
     {
       "name": "moonshot",
@@ -13,7 +14,8 @@
       "name": "deepseek",
       "type": "openai-compatible",
       "base_url": "https://api.deepseek.com/v1",
-      "api_key": "${DEEPSEEK_API_KEY}"
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "supported_api_types": ["chat_completions"]
     },
     {
       "name": "anthropic",

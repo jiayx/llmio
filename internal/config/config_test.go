@@ -127,3 +127,48 @@ func TestLoadRejectsDuplicateModelRoutes(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestLoadDefaultsDatabasePath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "llmio.json")
+
+	if err := os.WriteFile(configPath, []byte(`{
+		"admin_api_keys": ["admin-1"],
+		"providers": [{"name":"p","type":"openai-compatible","base_url":"https://example.com/v1"}],
+		"model_routes": [{"external_model":"m","targets":[{"provider":"p","backend_model":"backend"}]}]
+	}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.AdminAPIKeys) != 1 || cfg.AdminAPIKeys[0] != "admin-1" {
+		t.Fatalf("admin_api_keys = %#v", cfg.AdminAPIKeys)
+	}
+	if cfg.DatabasePath != filepath.Join(dir, "llmio.db") {
+		t.Fatalf("database_path = %q", cfg.DatabasePath)
+	}
+}
+
+func TestLoadPreservesAdminAPIKeys(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "llmio.json")
+
+	if err := os.WriteFile(configPath, []byte(`{
+		"admin_api_keys": ["admin-1", " admin-2 "],
+		"providers": [{"name":"p","type":"openai-compatible","base_url":"https://example.com/v1"}],
+		"model_routes": [{"external_model":"m","targets":[{"provider":"p","backend_model":"backend"}]}]
+	}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.AdminAPIKeys) != 2 || cfg.AdminAPIKeys[0] != "admin-1" || cfg.AdminAPIKeys[1] != "admin-2" {
+		t.Fatalf("admin_api_keys = %#v", cfg.AdminAPIKeys)
+	}
+}

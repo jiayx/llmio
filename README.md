@@ -7,6 +7,10 @@
 - OpenAI 风格接口：`/v1/chat/completions`、`/v1/responses`、`/v1/models`
 - Anthropic 风格接口：`/anthropic/v1/messages`
 
+兼容性说明：
+
+- OpenAI 风格接口额外接受无 `/v1` 前缀的别名：`/chat/completions`、`/responses`、`/models`
+
 当前代码已经拆成三层：
 
 - 客户端协议适配器：把 OpenAI、Anthropic、未来的 Claude Code、Codex 等客户端请求转换成统一内部模型
@@ -20,6 +24,8 @@
 - 单一网关同时暴露 OpenAI 和 Anthropic 风格 endpoint
 - 模型名映射：外部模型名 -> 后端 provider target 链路
 - 网关 API Key 鉴权，兼容 `Authorization: Bearer` 和 `x-api-key`
+- 通过管理接口创建/停用业务 API Key
+- 按业务 API Key 聚合 token 用量
 - provider fallback，支持一个模型挂多个后端目标
 - 客户端协议层和后端 provider 层已经解耦
 - 同协议链路优先走 passthrough fast path，请求侧改写 `model`，响应侧过滤敏感 header 并重写 `model`
@@ -44,7 +50,7 @@ cp llmio.json.example llmio.json
 export MOONSHOT_API_KEY=xxx
 export DEEPSEEK_API_KEY=xxx
 export ANTHROPIC_API_KEY=xxx
-export LLMIO_API_KEY=xxx
+export LLMIO_ADMIN_API_KEY=xxx
 ```
 
 启动：
@@ -70,7 +76,8 @@ LLMIO_CONFIG=/path/to/llmio.json go run ./cmd/llmio
 - `providers[].base_url`：后端 API 的 base URL，例如 `https://api.deepseek.com/v1` 或 `https://api.anthropic.com/v1`
 - `providers[].api_key`：API Key，支持 `${ENV_NAME}` 环境变量展开
 - `providers[].supported_api_types`：声明 provider 原生支持哪些 API 类型；为空表示默认全支持。当前已用到的值包括 OpenAI 的 `chat_completions`、`responses`，以及 Anthropic 的 `messages`
-- `api_keys[]`：调用网关时允许的 API Key；为空则关闭网关鉴权
+- `admin_api_keys[]`：管理接口使用的管理员 API Key
+- `database_path`：网关 SQLite 数据库文件路径；默认是配置文件目录下的 `llmio.db`
 - `model_routes[].external_model`：对客户端暴露的模型名
 - `model_routes[].targets[]`：按顺序尝试的 provider 目标列表
 - `model_routes[].targets[].provider`：命中的 provider
@@ -118,11 +125,47 @@ passthrough 的判定规则是：
 
 ## 示例
 
+### 管理 API Key
+
+创建业务 API Key：
+
+```bash
+curl http://127.0.0.1:8080/admin/api-keys \
+  -H 'Authorization: Bearer admin-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "crm-system"
+  }'
+```
+
+返回里会包含一次性的 `secret`，后续业务系统拿这个 key 调用 LLM 接口。
+
+查看业务 API Key 和累计 token：
+
+```bash
+curl http://127.0.0.1:8080/admin/api-keys \
+  -H 'Authorization: Bearer admin-secret'
+```
+
+查看所有 API Key 的 token 用量汇总：
+
+```bash
+curl http://127.0.0.1:8080/admin/usage \
+  -H 'Authorization: Bearer admin-secret'
+```
+
+查看单个 API Key 的 token 用量：
+
+```bash
+curl http://127.0.0.1:8080/admin/api-keys/key_xxx/usage \
+  -H 'Authorization: Bearer admin-secret'
+```
+
 ### OpenAI 风格调用
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Authorization: Bearer xxx' \
+  -H 'Authorization: Bearer llmio_xxx' \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gpt-4o-proxy",
@@ -136,7 +179,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses \
-  -H 'Authorization: Bearer xxx' \
+  -H 'Authorization: Bearer llmio_xxx' \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gpt-4o-proxy",
@@ -148,7 +191,7 @@ curl http://127.0.0.1:8080/v1/responses \
 
 ```bash
 curl http://127.0.0.1:8080/anthropic/v1/messages \
-  -H 'x-api-key: xxx' \
+  -H 'x-api-key: llmio_xxx' \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
@@ -164,7 +207,7 @@ curl http://127.0.0.1:8080/anthropic/v1/messages \
 
 ```bash
 curl http://127.0.0.1:8080/anthropic/v1/messages \
-  -H 'x-api-key: xxx' \
+  -H 'x-api-key: llmio_xxx' \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{

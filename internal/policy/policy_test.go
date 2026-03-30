@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,18 +14,20 @@ import (
 	"github.com/jiayx/llmio/internal/protocols"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
+	"github.com/jiayx/llmio/internal/usage"
 )
 
 func TestExecuteChatFallsBackOnRetryableError(t *testing.T) {
-	p := New(Config{
+	recorder := &usageSpy{}
+	p := NewWithRecorder(Config{
 		RequestTimeout:       time.Second,
 		StreamSetupTimeout:   time.Second,
 		BreakerFailureThresh: 3,
 		BreakerOpenFor:       time.Second,
 	}, map[string]providerapi.ProviderAdapter{
 		"primary":   policyStubProvider{chatErr: errors.New("provider primary returned status 503: busy")},
-		"secondary": policyStubProvider{chatResp: &llm.ChatResponse{ID: "ok"}},
-	})
+		"secondary": policyStubProvider{chatResp: &llm.ChatResponse{ID: "ok", InputTokens: 11, OutputTokens: 7}},
+	}, recorder)
 
 	resp, err := p.ExecuteChat(context.Background(), routing.Route{
 		Targets: []routing.Target{
@@ -37,6 +40,15 @@ func TestExecuteChatFallsBackOnRetryableError(t *testing.T) {
 	}
 	if resp.ID != "ok" {
 		t.Fatalf("resp = %#v", resp)
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("usage events = %#v", recorder.events)
+	}
+	if recorder.events[0].ProviderName != "secondary" || recorder.events[0].BackendModel != "b" || recorder.events[0].ExternalModel != "proxy" {
+		t.Fatalf("usage event = %#v", recorder.events[0])
+	}
+	if recorder.events[0].InputTokens != 11 || recorder.events[0].OutputTokens != 7 || !recorder.events[0].UsageKnown {
+		t.Fatalf("usage event = %#v", recorder.events[0])
 	}
 }
 
@@ -100,12 +112,209 @@ func TestExecutePassthroughUsesBreakerAfterRetryableFailures(t *testing.T) {
 	}
 }
 
-type policyStubProvider struct {
-	chatResp *llm.ChatResponse
-	chatErr  error
+func TestExecutePassthroughRecordsUsage(t *testing.T) {
+	recorder := &usageSpy{}
+	p := NewWithRecorder(DefaultConfig(), map[string]providerapi.ProviderAdapter{
+		"primary": &policyStubProvider{
+			forwardResponse: &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(bytes.NewBufferString(`{
+					"id":"resp_1",
+					"object":"response",
+					"model":"backend-model",
+					"status":"completed",
+					"output":[],
+					"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}
+				}`)),
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+			},
+		},
+	}, recorder)
 
-	statuses     []int
-	forwardCalls int
+	resp, handled, err := p.ExecutePassthrough(context.Background(), routing.Route{
+		Targets: []routing.Target{{ProviderName: "primary", BackendModel: "backend-model"}},
+	}, protocols.RequestMeta{
+		Protocol:      protocols.ProtocolOpenAI,
+		APIType:       protocols.APIResponses,
+		UpstreamPath:  "/responses",
+		ExternalModel: "proxy-model",
+		Body:          []byte(`{"model":"proxy-model"}`),
+		Headers:       http.Header{},
+	})
+	if err != nil || !handled {
+		t.Fatalf("ExecutePassthrough() handled=%v err=%v", handled, err)
+	}
+	if resp == nil {
+		t.Fatalf("response is nil")
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("usage events = %#v", recorder.events)
+	}
+	event := recorder.events[0]
+	if event.ProviderName != "primary" || event.BackendModel != "backend-model" || event.ExternalModel != "proxy-model" {
+		t.Fatalf("usage event = %#v", event)
+	}
+	if event.Protocol != protocols.ProtocolOpenAI || event.APIType != protocols.APIResponses || !event.Passthrough {
+		t.Fatalf("usage event = %#v", event)
+	}
+	if event.InputTokens != 9 || event.OutputTokens != 4 || !event.UsageKnown {
+		t.Fatalf("usage event = %#v", event)
+	}
+}
+
+func TestExecutePassthroughFallsBackOnUnsupportedStatus(t *testing.T) {
+	recorder := &usageSpy{}
+	primary := &policyStubProvider{
+		forwardResponse: &http.Response{
+			StatusCode: http.StatusNotFound,
+			Body:       io.NopCloser(bytes.NewBufferString("")),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		},
+	}
+	secondary := &policyStubProvider{
+		forwardResponse: &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(bytes.NewBufferString(`{
+				"id":"resp_1",
+				"object":"response",
+				"model":"backend-model-2",
+				"status":"completed",
+				"output":[],
+				"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}
+			}`)),
+			Header: http.Header{"Content-Type": []string{"application/json"}},
+		},
+	}
+	p := NewWithRecorder(DefaultConfig(), map[string]providerapi.ProviderAdapter{
+		"primary":   primary,
+		"secondary": secondary,
+	}, recorder)
+
+	resp, handled, err := p.ExecutePassthrough(context.Background(), routing.Route{
+		Targets: []routing.Target{
+			{ProviderName: "primary", BackendModel: "backend-model-1"},
+			{ProviderName: "secondary", BackendModel: "backend-model-2"},
+		},
+	}, protocols.RequestMeta{
+		Protocol:      protocols.ProtocolOpenAI,
+		APIType:       protocols.APIResponses,
+		UpstreamPath:  "/responses",
+		ExternalModel: "proxy-model",
+		Body:          []byte(`{"model":"proxy-model"}`),
+		Headers:       http.Header{},
+	})
+	if err != nil || !handled {
+		t.Fatalf("ExecutePassthrough() handled=%v err=%v", handled, err)
+	}
+	if resp == nil {
+		t.Fatalf("response is nil")
+	}
+	if primary.forwardCalls != 1 || secondary.forwardCalls != 1 {
+		t.Fatalf("forward calls: primary=%d secondary=%d", primary.forwardCalls, secondary.forwardCalls)
+	}
+	if len(recorder.events) != 1 || recorder.events[0].ProviderName != "secondary" {
+		t.Fatalf("usage events = %#v", recorder.events)
+	}
+}
+
+func TestExecutePassthroughRecordsUsageForResponsesSSE(t *testing.T) {
+	recorder := &usageSpy{}
+	p := NewWithRecorder(DefaultConfig(), map[string]providerapi.ProviderAdapter{
+		"primary": &policyStubProvider{
+			forwardResponse: &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(bytes.NewBufferString("" +
+					"event: response.created\n" +
+					"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" +
+					"event: response.completed\n" +
+					"data: {\"id\":\"resp_1\",\"object\":\"response\",\"model\":\"backend-model\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":4,\"total_tokens\":13}}\n\n")),
+				Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			},
+		},
+	}, recorder)
+
+	resp, handled, err := p.ExecutePassthrough(context.Background(), routing.Route{
+		Targets: []routing.Target{{ProviderName: "primary", BackendModel: "backend-model"}},
+	}, protocols.RequestMeta{
+		Protocol:      protocols.ProtocolOpenAI,
+		APIType:       protocols.APIResponses,
+		UpstreamPath:  "/responses",
+		ExternalModel: "proxy-model",
+		Body:          []byte(`{"model":"proxy-model","stream":true}`),
+		Headers:       http.Header{},
+		Stream:        true,
+	})
+	if err != nil || !handled {
+		t.Fatalf("ExecutePassthrough() handled=%v err=%v", handled, err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read passthrough body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close passthrough body: %v", err)
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("usage events = %#v", recorder.events)
+	}
+	event := recorder.events[0]
+	if !event.Stream || !event.Passthrough || !event.UsageKnown {
+		t.Fatalf("usage event = %#v", event)
+	}
+	if event.InputTokens != 9 || event.OutputTokens != 4 {
+		t.Fatalf("usage event = %#v", event)
+	}
+}
+
+func TestExecuteStreamRecordsUsageOnGracefulEOFWithoutStopEvent(t *testing.T) {
+	recorder := &usageSpy{}
+	events := make(chan llm.StreamEvent, 1)
+	events <- llm.StreamEvent{Type: llm.StreamEventUsage, InputTokens: 12, OutputTokens: 5}
+	close(events)
+	errs := make(chan error)
+	close(errs)
+
+	p := NewWithRecorder(DefaultConfig(), map[string]providerapi.ProviderAdapter{
+		"primary": policyStubProvider{
+			stream: &providerapi.StreamReader{
+				Events: events,
+				Err:    errs,
+				Close: func() error {
+					return nil
+				},
+			},
+		},
+	}, recorder)
+
+	stream, err := p.ExecuteStream(context.Background(), routing.Route{
+		Targets: []routing.Target{{ProviderName: "primary", BackendModel: "backend-model"}},
+	}, llm.ChatRequest{Model: "proxy-model", Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for range stream.Events {
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("usage events = %#v", recorder.events)
+	}
+	event := recorder.events[0]
+	if !event.Stream || event.Passthrough || !event.UsageKnown {
+		t.Fatalf("usage event = %#v", event)
+	}
+	if event.InputTokens != 12 || event.OutputTokens != 5 {
+		t.Fatalf("usage event = %#v", event)
+	}
+}
+
+type policyStubProvider struct {
+	chatResp      *llm.ChatResponse
+	chatErr       error
+	stream        *providerapi.StreamReader
+	streamErr     error
+	streamFactory func(context.Context, llm.ChatRequest) (*providerapi.StreamReader, error)
+
+	statuses        []int
+	forwardCalls    int
+	forwardResponse *http.Response
 }
 
 func (p policyStubProvider) Name() string { return "stub" }
@@ -114,16 +323,28 @@ func (p policyStubProvider) Chat(context.Context, llm.ChatRequest) (*llm.ChatRes
 	return p.chatResp, p.chatErr
 }
 
-func (p policyStubProvider) ChatStream(context.Context, llm.ChatRequest) (*providerapi.StreamReader, error) {
+func (p policyStubProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (*providerapi.StreamReader, error) {
+	if p.streamFactory != nil {
+		return p.streamFactory(ctx, req)
+	}
+	if p.streamErr != nil {
+		return nil, p.streamErr
+	}
+	if p.stream != nil {
+		return p.stream, nil
+	}
 	return nil, errors.New("not implemented")
 }
 
 func (p *policyStubProvider) SupportsPassthrough(protocol, apiType string) bool {
-	return protocol == protocols.ProtocolOpenAI && apiType == protocols.APIChatCompletions
+	return protocol == protocols.ProtocolOpenAI && (apiType == protocols.APIChatCompletions || apiType == protocols.APIResponses)
 }
 
 func (p *policyStubProvider) Forward(_ context.Context, _, _ string, _ []byte, _ http.Header) (*http.Response, error) {
 	p.forwardCalls++
+	if p.forwardResponse != nil {
+		return p.forwardResponse, nil
+	}
 	status := http.StatusOK
 	if len(p.statuses) >= p.forwardCalls {
 		status = p.statuses[p.forwardCalls-1]
@@ -137,4 +358,15 @@ func (p *policyStubProvider) Forward(_ context.Context, _, _ string, _ []byte, _
 		Body:       body,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 	}, nil
+}
+
+type usageSpy struct {
+	mu     sync.Mutex
+	events []usage.Event
+}
+
+func (s *usageSpy) Record(_ context.Context, event usage.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
 }

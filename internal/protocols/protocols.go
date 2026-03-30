@@ -22,6 +22,8 @@ type RequestMeta struct {
 	APIType       string
 	UpstreamPath  string
 	ExternalModel string
+	APIKeyID      string
+	APIKeyName    string
 	Body          []byte
 	Headers       http.Header
 	Stream        bool
@@ -63,8 +65,11 @@ func (OpenAIAdapter) Protocol() string {
 func (OpenAIAdapter) Endpoints() []Endpoint {
 	return []Endpoint{
 		{APIType: APIModels, InboundPath: "/v1/models", UpstreamPath: "/models"},
+		{APIType: APIModels, InboundPath: "/models", UpstreamPath: "/models"},
 		{APIType: APIChatCompletions, InboundPath: "/v1/chat/completions", UpstreamPath: "/chat/completions"},
+		{APIType: APIChatCompletions, InboundPath: "/chat/completions", UpstreamPath: "/chat/completions"},
 		{APIType: APIResponses, InboundPath: "/v1/responses", UpstreamPath: "/responses"},
+		{APIType: APIResponses, InboundPath: "/responses", UpstreamPath: "/responses"},
 	}
 }
 

@@ -2,13 +2,17 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
+	"github.com/jiayx/llmio/internal/apikeys"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
 	"github.com/jiayx/llmio/internal/policy"
@@ -26,7 +30,8 @@ type modelRoute = routing.Route
 
 // Server routes compatible OpenAI and Anthropic requests to configured providers.
 type Server struct {
-	apiKeys          map[string]struct{}
+	adminAPIKeys     map[string]apikeys.Principal
+	apiKeyStore      *apikeys.Store
 	providers        map[string]chatProvider
 	router           *routing.Router
 	policy           *policy.Policy
@@ -36,16 +41,25 @@ type Server struct {
 // NewServer constructs a gateway server from config.
 func NewServer(cfg *config.Config) (*Server, error) {
 	s := &Server{
-		apiKeys:          make(map[string]struct{}, len(cfg.APIKeys)),
+		adminAPIKeys:     make(map[string]apikeys.Principal, len(cfg.AdminAPIKeys)),
 		providers:        make(map[string]chatProvider, len(cfg.Providers)),
 		protocolAdapters: protocols.DefaultAdapters(),
 	}
 
-	for _, key := range cfg.APIKeys {
+	for _, key := range cfg.AdminAPIKeys {
 		if key != "" {
-			s.apiKeys[key] = struct{}{}
+			s.adminAPIKeys[key] = apikeys.Principal{
+				ID:   "admin:" + maskAPIKey(key),
+				Name: "admin",
+			}
 		}
 	}
+
+	store, err := apikeys.Open(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	s.apiKeyStore = store
 
 	for _, p := range cfg.Providers {
 		adapter, err := providers.NewAdapter(p)
@@ -60,7 +74,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 	s.router = router
-	s.policy = policy.New(policy.DefaultConfig(), s.providers)
+	s.policy = policy.NewWithRecorder(policy.DefaultConfig(), s.providers, store)
 
 	return s, nil
 }
@@ -69,13 +83,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/admin/usage", s.handleAdminUsage)
+	mux.HandleFunc("/admin/api-keys", s.handleAdminAPIKeys)
+	mux.HandleFunc("/admin/api-keys/", s.handleAdminAPIKeyByID)
 	s.registerProtocolRoutes(mux)
-	return s.withLogging(s.withAuth(mux))
+	return s.withRecovery(s.withLogging(s.withAuth(mux)))
 }
 
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || len(s.apiKeys) == 0 {
+		if r.URL.Path == "/healthz" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -84,33 +101,108 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 		if key == "" {
 			key = strings.TrimSpace(r.Header.Get("x-api-key"))
 		}
-		if _, ok := s.apiKeys[key]; !ok {
-			if route, ok := s.protocolAdapterForPath(r.URL.Path); ok && route.Protocol() == protocols.ProtocolAnthropic {
-				protocolanthropic.WriteError(w, http.StatusUnauthorized, "authentication_error", "unauthorized")
-			} else if ok {
-				protocolopenai.WriteError(w, http.StatusUnauthorized, "unauthorized")
-			} else {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if strings.HasPrefix(r.URL.Path, "/admin/") {
+			principal, ok := s.adminAPIKeys[key]
+			if !ok {
+				writeUnauthorized(w, r.URL.Path)
+				return
 			}
+			next.ServeHTTP(w, r.WithContext(apikeys.WithPrincipal(r.Context(), principal)))
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		principal, ok := s.authenticateLLMKey(key)
+		if !ok {
+			if len(s.adminAPIKeys) == 0 && (s.apiKeyStore == nil || len(s.apiKeyStore.List()) == 0) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeUnauthorized(w, r.URL.Path)
+			return
+		}
+
+		next.ServeHTTP(w, r.WithContext(apikeys.WithPrincipal(r.Context(), principal)))
 	})
+}
+
+func (s *Server) authenticateLLMKey(key string) (apikeys.Principal, bool) {
+	if principal, ok := s.adminAPIKeys[key]; ok {
+		return principal, true
+	}
+	if s.apiKeyStore == nil {
+		return apikeys.Principal{}, false
+	}
+	return s.apiKeyStore.Authenticate(key)
+}
+
+func writeUnauthorized(w http.ResponseWriter, path string) {
+	if adapter, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok && adapter.Protocol() == protocols.ProtocolAnthropic {
+		protocolanthropic.WriteError(w, http.StatusUnauthorized, "authentication_error", "unauthorized")
+		return
+	}
+	if _, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok {
+		protocolopenai.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+}
+
+func writePanicError(w http.ResponseWriter, path string) {
+	if adapter, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok && adapter.Protocol() == protocols.ProtocolAnthropic {
+		protocolanthropic.WriteError(w, http.StatusInternalServerError, "api_error", "internal server error")
+		return
+	}
+	if _, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok {
+		protocolopenai.WriteError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal server error"})
+}
+
+func maskAPIKey(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) <= 8 {
+		return key
+	}
+	return key[:8]
 }
 
 func (s *Server) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		ww := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			slog.Info("request completed",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", ww.status,
+				"duration", time.Since(start).Truncate(time.Millisecond),
+				"remote", r.RemoteAddr,
+			)
+		}()
 		next.ServeHTTP(ww, r)
-		slog.Info("request completed",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", ww.status,
-			"duration", time.Since(start).Truncate(time.Millisecond),
-			"remote", r.RemoteAddr,
-		)
+	})
+}
+
+func (s *Server) withRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ww := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.Error("request panic",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"remote", r.RemoteAddr,
+					"panic", fmt.Sprint(recovered),
+					"stack", string(debug.Stack()),
+				)
+				if ww.wrote {
+					return
+				}
+				writePanicError(ww, r.URL.Path)
+			}
+		}()
+		next.ServeHTTP(ww, r)
 	})
 }
 
@@ -118,6 +210,112 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
+}
+
+func (s *Server) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"data": s.apiKeyStore.List(),
+		})
+	case http.MethodPost:
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		created, err := s.apiKeyStore.Create(req.Name)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+	}
+}
+
+func (s *Server) handleAdminAPIKeyByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/admin/api-keys/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if strings.HasSuffix(id, "/usage") {
+		id = strings.TrimSuffix(id, "/usage")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleAdminAPIKeyUsage(w, r, id)
+		return
+	}
+	if strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		key, ok := s.apiKeyStore.Get(id)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, key)
+	case http.MethodDelete:
+		key, err := s.apiKeyStore.Disable(id)
+		if err != nil {
+			if err == os.ErrNotExist {
+				http.NotFound(w, r)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, key)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodDelete)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+	}
+}
+
+func (s *Server) handleAdminAPIKeyUsage(w http.ResponseWriter, r *http.Request, id string) {
+	if !allowsMethod(r.Method, http.MethodGet) {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	report, ok := s.apiKeyStore.UsageByID(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *Server) handleAdminUsage(w http.ResponseWriter, r *http.Request) {
+	if !allowsMethod(r.Method, http.MethodGet) {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	data, total := s.apiKeyStore.UsageReports()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": total,
+		"data":  data,
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		slog.Error("write json", "status", status, "err", err)
+	}
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +358,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		"route_targets", routeTargetsForLog(route),
 	)
 
-	meta, err := s.protocolRequestMetaForPath(r.URL.Path, req.Model, body, r.Header, req.Stream)
+	meta, err := s.protocolRequestMetaForPath(r.Context(), r.URL.Path, req.Model, body, r.Header, req.Stream)
 	if err != nil {
 		protocolopenai.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -224,7 +422,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		"route_targets", routeTargetsForLog(route),
 	)
 
-	meta, err := s.protocolRequestMetaForPath(r.URL.Path, req.Model, body, r.Header, req.Stream)
+	meta, err := s.protocolRequestMetaForPath(r.Context(), r.URL.Path, req.Model, body, r.Header, req.Stream)
 	if err != nil {
 		protocolopenai.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -289,7 +487,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		"route_targets", routeTargetsForLog(route),
 	)
 
-	meta, err := s.protocolRequestMetaForPath(r.URL.Path, req.Model, body, r.Header, req.Stream)
+	meta, err := s.protocolRequestMetaForPath(r.Context(), r.URL.Path, req.Model, body, r.Header, req.Stream)
 	if err != nil {
 		protocolanthropic.WriteError(w, http.StatusInternalServerError, "api_error", err.Error())
 		return
@@ -423,12 +621,17 @@ func (s *Server) protocolAdapterForPath(path string) (protocols.ProtocolAdapter,
 	return adapter, ok
 }
 
-func (s *Server) protocolRequestMetaForPath(path, externalModel string, body []byte, headers http.Header, stream bool) (protocols.RequestMeta, error) {
+func (s *Server) protocolRequestMetaForPath(ctx context.Context, path, externalModel string, body []byte, headers http.Header, stream bool) (protocols.RequestMeta, error) {
 	adapter, endpoint, ok := protocols.LookupEndpoint(s.protocolAdaptersOrDefault(), path)
 	if !ok {
 		return protocols.RequestMeta{}, fmt.Errorf("unsupported client path %q", path)
 	}
-	return adapter.Request(endpoint, externalModel, body, headers, stream), nil
+	meta := adapter.Request(endpoint, externalModel, body, headers, stream)
+	if principal, ok := apikeys.PrincipalFromContext(ctx); ok {
+		meta.APIKeyID = principal.ID
+		meta.APIKeyName = principal.Name
+	}
+	return meta, nil
 }
 
 func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, route modelRoute, req llm.ChatRequest) {

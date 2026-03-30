@@ -203,15 +203,19 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 				return
 			}
 		case err, ok := <-stream.Err:
-			if ok && err != nil && !shouldIgnoreStreamError(r, err) {
-				httpio.WriteSSEJSON(w, "error", map[string]any{
-					"type": "error",
-					"error": Error{
-						Type:    "api_error",
-						Message: err.Error(),
-					},
-				})
-				flusher.Flush()
+			if ok && err != nil {
+				if shouldIgnoreStreamError(r, err) {
+					logDownstreamDisconnected(r, "anthropic", "messages", err)
+				} else {
+					httpio.WriteSSEJSON(w, "error", map[string]any{
+						"type": "error",
+						"error": Error{
+							Type:    "api_error",
+							Message: err.Error(),
+						},
+					})
+					flusher.Flush()
+				}
 			}
 			return
 		}
@@ -250,6 +254,16 @@ func shouldIgnoreStreamError(r *http.Request, err error) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "context canceled")
+}
+
+func logDownstreamDisconnected(r *http.Request, protocol, apiType string, err error) {
+	slog.Info("downstream disconnected",
+		"protocol", protocol,
+		"api_type", apiType,
+		"path", r.URL.Path,
+		"remote", r.RemoteAddr,
+		"err", err,
+	)
 }
 
 func anthropicContentBlockFromPart(part llm.ContentPart) ContentBlock {

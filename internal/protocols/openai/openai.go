@@ -192,10 +192,14 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 				return
 			}
 		case err, ok := <-stream.Err:
-			if ok && err != nil && !shouldIgnoreStreamError(r, err) {
-				slog.Error("stream failed", "protocol", "openai", "api_type", "chat_completions", "err", err)
-				httpio.WriteSSE(w, "", "[DONE]")
-				flusher.Flush()
+			if ok && err != nil {
+				if shouldIgnoreStreamError(r, err) {
+					logDownstreamDisconnected(r, "openai", "chat_completions", err)
+				} else {
+					slog.Error("stream failed", "protocol", "openai", "api_type", "chat_completions", "err", err)
+					httpio.WriteSSE(w, "", "[DONE]")
+					flusher.Flush()
+				}
 			}
 			return
 		}
@@ -371,8 +375,12 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 				return
 			}
 		case err, ok := <-stream.Err:
-			if ok && err != nil && !shouldIgnoreStreamError(r, err) {
-				slog.Error("stream failed", "protocol", "openai", "api_type", "responses", "err", err)
+			if ok && err != nil {
+				if shouldIgnoreStreamError(r, err) {
+					logDownstreamDisconnected(r, "openai", "responses", err)
+				} else {
+					slog.Error("stream failed", "protocol", "openai", "api_type", "responses", "err", err)
+				}
 			}
 			return
 		}
@@ -485,6 +493,16 @@ func shouldIgnoreStreamError(r *http.Request, err error) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "context canceled")
+}
+
+func logDownstreamDisconnected(r *http.Request, protocol, apiType string, err error) {
+	slog.Info("downstream disconnected",
+		"protocol", protocol,
+		"api_type", apiType,
+		"path", r.URL.Path,
+		"remote", r.RemoteAddr,
+		"err", err,
+	)
 }
 
 type streamToolState struct {

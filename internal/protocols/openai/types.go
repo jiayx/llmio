@@ -3,15 +3,20 @@ package openai
 import "encoding/json"
 
 type ChatCompletionRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature *float64  `json:"temperature,omitempty"`
-	TopP        *float64  `json:"top_p,omitempty"`
-	MaxTokens   *int      `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
-	User        string    `json:"user,omitempty"`
-	Tools       []Tool    `json:"tools,omitempty"`
-	ToolChoice  any       `json:"tool_choice,omitempty"`
+	Model         string                       `json:"model"`
+	Messages      []Message                    `json:"messages"`
+	Temperature   *float64                     `json:"temperature,omitempty"`
+	TopP          *float64                     `json:"top_p,omitempty"`
+	MaxTokens     *int                         `json:"max_tokens,omitempty"`
+	Stream        bool                         `json:"stream,omitempty"`
+	StreamOptions *ChatCompletionStreamOptions `json:"stream_options,omitempty"`
+	User          string                       `json:"user,omitempty"`
+	Tools         []Tool                       `json:"tools,omitempty"`
+	ToolChoice    any                          `json:"tool_choice,omitempty"`
+}
+
+type ChatCompletionStreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type Message struct {
@@ -52,13 +57,15 @@ type StreamChoice struct {
 	Index        int         `json:"index"`
 	Delta        StreamDelta `json:"delta"`
 	FinishReason string      `json:"finish_reason"`
+	Usage        *CompletionUsage `json:"usage,omitempty"`
 }
 
 type StreamDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	Reasoning string     `json:"reasoning,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	Reasoning        string     `json:"reasoning,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type CompletionUsage struct {

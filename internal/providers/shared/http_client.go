@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/jiayx/llmio/internal/debugtrace"
 )
 
 type RequestMutator func(*http.Request)
@@ -60,6 +62,13 @@ func (c *HTTPClient) Do(ctx context.Context, method, path string, body []byte, i
 		"url", target,
 		"body_bytes", len(body),
 	)
+	if debugtrace.Enabled() {
+		slog.Debug("provider http request trace",
+			"method", method,
+			"url", target,
+			"body", debugtrace.Bytes(body),
+		)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -70,6 +79,14 @@ func (c *HTTPClient) Do(ctx context.Context, method, path string, body []byte, i
 		"url", target,
 		"status", resp.StatusCode,
 	)
+	if debugtrace.Enabled() {
+		slog.Debug("provider http response trace",
+			"method", method,
+			"url", target,
+			"status", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+		)
+	}
 	return resp, nil
 }
 
