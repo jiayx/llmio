@@ -4,3 +4,5 @@
 .env
 llmio.json
 llmio.db
+dist
+deploy/.env

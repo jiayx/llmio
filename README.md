@@ -61,6 +61,56 @@ go run ./cmd/llmio
 
 默认监听 `:18080`，也可以通过 `llmio.json` 中的 `listen` 调整。
 
+## 部署
+
+仓库内置了一个简单发布脚本，包含：
+
+- 本地交叉编译并打包 `tar.gz`
+- 上传到远端服务器
+- 安装或更新 `systemd` service
+- 切换 `current` 软链并重启服务
+
+先看帮助：
+
+```bash
+bash deploy/deploy.sh --help
+```
+
+只打包：
+
+```bash
+VERSION=v0.1.0 bash deploy/deploy.sh package
+```
+
+发布到服务器：
+
+```bash
+VERSION=v0.1.0 \
+bash deploy/deploy.sh deploy
+```
+
+如果不想每次都在命令行写服务器信息，可以先准备：
+
+```bash
+cp deploy/.env.example deploy/.env
+```
+
+然后把 `deploy/.env` 改成你的实际值，脚本会自动加载它。
+
+默认约定：
+
+- 远端程序目录：`/opt/llmio`
+- 远端配置目录：`/etc/llmio`
+- systemd unit：`/etc/systemd/system/llmio.service`
+- 运行用户：`llmio`
+
+首次部署后，远端会自动生成：
+
+- `/etc/llmio/llmio.env`
+- `/etc/llmio/llmio.json`
+
+你需要按实际环境补齐其中的配置和密钥。
+
 ## 配置
 
 配置文件默认从 `llmio.json` 读取，也可以通过环境变量指定：

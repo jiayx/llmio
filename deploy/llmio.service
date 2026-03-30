@@ -1,0 +1,17 @@
+[Unit]
+Description=llmio
+After=network.target
+
+[Service]
+Type=simple
+User=llmio
+Group=llmio
+WorkingDirectory=/opt/llmio/current
+EnvironmentFile=/etc/llmio/llmio.env
+ExecStart=/opt/llmio/current/llmio
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
