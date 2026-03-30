@@ -42,7 +42,7 @@ func WriteError(w http.ResponseWriter, status int, message string) {
 		"error_type", "invalid_request_error",
 		"message", message,
 	)
-	httpio.WriteJSON(w, status, ChatCompletionResponse{
+	httpio.WriteJSON(w, status, ErrorResponse{
 		Error: &CompletionError{
 			Message: message,
 			Type:    "invalid_request_error",
@@ -70,9 +70,11 @@ func WriteModels(w http.ResponseWriter, infos []routing.ModelInfo) {
 func WriteChatCompletionResponse(w http.ResponseWriter, externalModel string, resp *llm.ChatResponse) {
 	parts := resp.EffectiveOutput()
 	content, toolCalls := llmContentToOpenAI(parts)
+	created := time.Now().Unix()
 	httpio.WriteJSON(w, http.StatusOK, ChatCompletionResponse{
 		ID:      resp.ID,
 		Object:  "chat.completion",
+		Created: created,
 		Model:   externalModel,
 		Choices: []Choice{{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls}, FinishReason: resp.FinishReason}},
 		Usage: &CompletionUsage{
@@ -126,6 +128,9 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 
 	toolStates := make(map[string]*streamToolState)
 	toolOrder := make([]string, 0)
+	chunkID := streamObjectID("chatcmpl")
+	created := time.Now().Unix()
+	emittedRole := false
 
 	for {
 		select {
@@ -138,12 +143,18 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 			switch event.Type {
 			case llm.StreamEventDelta:
 				chunk := StreamChunk{
-					Object: "chat.completion.chunk",
-					Model:  externalModel,
+					ID:      chunkID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   externalModel,
 					Choices: []StreamChoice{{
 						Index: 0,
 						Delta: StreamDelta{},
 					}},
+				}
+				if !emittedRole {
+					chunk.Choices[0].Delta.Role = "assistant"
+					emittedRole = true
 				}
 				if event.Part.Type == llm.ContentTypeReasoning {
 					chunk.Choices[0].Delta.Reasoning = event.TextDelta
@@ -155,8 +166,10 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 			case llm.StreamEventTool:
 				key, state := upsertStreamToolState(toolStates, &toolOrder, event)
 				chunk := StreamChunk{
-					Object: "chat.completion.chunk",
-					Model:  externalModel,
+					ID:      chunkID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   externalModel,
 					Choices: []StreamChoice{{
 						Index: 0,
 						Delta: StreamDelta{
@@ -178,8 +191,10 @@ func ServeChatCompletionStream(w http.ResponseWriter, r *http.Request, externalM
 				}
 			case llm.StreamEventStop:
 				chunk := StreamChunk{
-					Object: "chat.completion.chunk",
-					Model:  externalModel,
+					ID:      chunkID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   externalModel,
 					Choices: []StreamChoice{{
 						Index:        0,
 						Delta:        StreamDelta{},
@@ -221,11 +236,15 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
+	responseID := streamObjectID("resp")
+	createdAt := time.Now().Unix()
 	httpio.WriteSSEJSON(w, "response.created", ResponsesResponse{
-		Object: "response",
-		Model:  externalModel,
-		Status: "in_progress",
-		Output: []ResponseOutputItem{},
+		ID:        responseID,
+		Object:    "response",
+		CreatedAt: createdAt,
+		Model:     externalModel,
+		Status:    "in_progress",
+		Output:    []ResponseOutputItem{},
 	})
 	flusher.Flush()
 
@@ -243,7 +262,9 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 		case event, ok := <-stream.Events:
 			if !ok {
 				httpio.WriteSSEJSON(w, "response.completed", ResponsesResponse{
+					ID:         responseID,
 					Object:     "response",
+					CreatedAt:  createdAt,
 					Model:      externalModel,
 					Status:     "completed",
 					Output:     responseOutputItems(streamResponseParts(output.String(), reasoning.String(), imageBlocks, imageOrder, toolStates, toolOrder)),
@@ -360,7 +381,9 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 					})
 				}
 				httpio.WriteSSEJSON(w, "response.completed", ResponsesResponse{
+					ID:         responseID,
 					Object:     "response",
+					CreatedAt:  createdAt,
 					Model:      externalModel,
 					Status:     "completed",
 					Output:     responseOutputItems(streamResponseParts(output.String(), reasoning.String(), imageBlocks, imageOrder, toolStates, toolOrder)),
@@ -467,7 +490,7 @@ func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall) {
 		}
 	}
 	if len(content) == 0 {
-		return "", toolCalls
+		return nil, toolCalls
 	}
 	if len(content) == 1 && content[0]["type"] == "text" {
 		return content[0]["text"], toolCalls
@@ -477,6 +500,10 @@ func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall) {
 		out = append(out, item)
 	}
 	return out, toolCalls
+}
+
+func streamObjectID(prefix string) string {
+	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 }
 
 func closeStream(stream *providerapi.StreamReader) {

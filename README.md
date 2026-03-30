@@ -59,7 +59,7 @@ export LLMIO_ADMIN_API_KEY=xxx
 go run ./cmd/llmio
 ```
 
-默认监听 `:8080`，也可以通过 `llmio.json` 中的 `listen` 调整。
+默认监听 `:18080`，也可以通过 `llmio.json` 中的 `listen` 调整。
 
 ## 配置
 

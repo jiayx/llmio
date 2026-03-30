@@ -48,12 +48,12 @@ func TestBootstrapBuildsApplication(t *testing.T) {
 }
 
 func TestApplicationListenAddrDefaults(t *testing.T) {
-	if got := (*Application)(nil).ListenAddr(); got != ":8080" {
+	if got := (*Application)(nil).ListenAddr(); got != ":18080" {
 		t.Fatalf("nil ListenAddr() = %q", got)
 	}
 
 	app := &Application{}
-	if got := app.ListenAddr(); got != ":8080" {
+	if got := app.ListenAddr(); got != ":18080" {
 		t.Fatalf("empty ListenAddr() = %q", got)
 	}
 }

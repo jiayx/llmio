@@ -22,6 +22,11 @@ func Bytes(data []byte) string {
 	return String(string(data))
 }
 
+func Limit() int {
+	load()
+	return limit
+}
+
 func String(s string) string {
 	load()
 	if limit <= 0 || len(s) <= limit {
@@ -36,7 +41,7 @@ func load() {
 		case "1", "true", "yes", "on":
 			enabled = true
 		}
-		limit = 4000
+		limit = 12000
 		if raw := strings.TrimSpace(os.Getenv("LLMIO_TRACE_LIMIT")); raw != "" {
 			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 				limit = parsed

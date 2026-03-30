@@ -1,6 +1,8 @@
 package openai
 
 import (
+	"encoding/json"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/jiayx/llmio/internal/llm"
@@ -37,5 +39,44 @@ func TestStreamChunkPayloadToLLMEventsSupportsReasoningContentAndChoiceUsage(t *
 	}
 	if events[3].Type != llm.StreamEventUsage || events[3].InputTokens != 12 || events[3].OutputTokens != 7 {
 		t.Fatalf("event3 = %#v", events[3])
+	}
+}
+
+func TestWriteErrorUsesOfficialEnvelope(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteError(rec, 400, "bad request")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal = %v", err)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Fatalf("body = %#v", body)
+	}
+	if _, ok := body["choices"]; ok {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestWriteChatCompletionResponseToolCallUsesNullContent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteChatCompletionResponse(rec, "gpt-proxy", &llm.ChatResponse{
+		ID: "resp_1",
+		Output: []llm.ContentPart{{
+			Type:       llm.ContentTypeToolCall,
+			Name:       "lookup",
+			ToolCallID: "call_1",
+			Input:      `{"q":"hi"}`,
+		}},
+	})
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal = %v", err)
+	}
+	choices := body["choices"].([]any)
+	message := choices[0].(map[string]any)["message"].(map[string]any)
+	if content, ok := message["content"]; ok && content != nil {
+		t.Fatalf("message = %#v", message)
 	}
 }

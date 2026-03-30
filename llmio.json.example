@@ -1,5 +1,5 @@
 {
-  "listen": ":8080",
+  "listen": ":18080",
   "admin_api_keys": ["${LLMIO_ADMIN_API_KEY}"],
   "database_path": "./llmio.db",
   "providers": [

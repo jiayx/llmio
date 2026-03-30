@@ -31,24 +31,22 @@ type ProviderConfig struct {
 
 // ModelRoute maps one external model name to one or more backend targets.
 type ModelRoute struct {
-	ExternalModel string   `json:"external_model"`
-	Provider      string   `json:"provider"`
-	BackendModel  string   `json:"backend_model"`
-	Targets       []Target `json:"targets"`
+	ExternalModel       string   `json:"external_model"`
+	Provider            string   `json:"provider"`
+	BackendModel        string   `json:"backend_model"`
+	IgnoreRequestFields []string `json:"ignore_request_fields,omitempty"`
+	Targets             []Target `json:"targets"`
 }
 
 // Target defines a single backend provider/model pair for routing.
 type Target struct {
-	Provider     string `json:"provider"`
-	BackendModel string `json:"backend_model"`
+	Provider            string   `json:"provider"`
+	BackendModel        string   `json:"backend_model"`
+	IgnoreRequestFields []string `json:"ignore_request_fields,omitempty"`
 }
 
 // Load reads, expands, validates, and normalizes a gateway config file.
 func Load(path string) (*Config, error) {
-	if err := loadDotEnvForConfig(path); err != nil {
-		return nil, err
-	}
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -120,18 +118,21 @@ func Load(path string) (*Config, error) {
 		if len(route.Targets) == 0 {
 			route.Provider = strings.TrimSpace(route.Provider)
 			route.BackendModel = strings.TrimSpace(route.BackendModel)
+			route.IgnoreRequestFields = normalizeRequestFields(route.IgnoreRequestFields)
 			if route.Provider == "" || route.BackendModel == "" {
 				return nil, fmt.Errorf("model route %q requires provider/backend_model or targets", route.ExternalModel)
 			}
 			route.Targets = []Target{{
-				Provider:     route.Provider,
-				BackendModel: route.BackendModel,
+				Provider:            route.Provider,
+				BackendModel:        route.BackendModel,
+				IgnoreRequestFields: route.IgnoreRequestFields,
 			}}
 		}
 		for j := range route.Targets {
 			target := &route.Targets[j]
 			target.Provider = strings.TrimSpace(target.Provider)
 			target.BackendModel = strings.TrimSpace(target.BackendModel)
+			target.IgnoreRequestFields = normalizeRequestFields(target.IgnoreRequestFields)
 			if target.Provider == "" {
 				return nil, fmt.Errorf("model route %q target[%d] provider is required", route.ExternalModel, j)
 			}
@@ -152,19 +153,29 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func loadDotEnvForConfig(configPath string) error {
-	seen := make(map[string]struct{}, 2)
-	paths := []string{filepath.Join(filepath.Dir(configPath), ".env"), ".env"}
-	for _, path := range paths {
-		if _, ok := seen[path]; ok {
+func normalizeRequestFields(fields []string) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(fields))
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		field = strings.ToLower(strings.TrimSpace(field))
+		if field == "" {
 			continue
 		}
-		seen[path] = struct{}{}
-		if err := loadDotEnv(path); err != nil {
-			return err
+		if _, ok := seen[field]; ok {
+			continue
 		}
+		seen[field] = struct{}{}
+		out = append(out, field)
 	}
-	return nil
+	return out
+}
+
+// LoadEnv loads the process .env file before any other config resolution.
+func LoadEnv() error {
+	return loadDotEnv(".env")
 }
 
 func loadDotEnv(path string) error {

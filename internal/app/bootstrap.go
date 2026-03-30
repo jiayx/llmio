@@ -39,7 +39,7 @@ func (a *Application) Handler() http.Handler {
 // ListenAddr returns the configured listen address with a sensible default.
 func (a *Application) ListenAddr() string {
 	if a == nil || a.Config == nil || a.Config.Listen == "" {
-		return ":8080"
+		return ":18080"
 	}
 	return a.Config.Listen
 }

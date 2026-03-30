@@ -411,6 +411,9 @@ func TestWriteLLMResponseAsOpenAI(t *testing.T) {
 	if body.Model != "gpt-proxy" || body.Choices[0].Message.Content != "hello" {
 		t.Fatalf("body = %#v", body)
 	}
+	if body.Created == 0 {
+		t.Fatalf("created = %#v", body)
+	}
 }
 
 func TestOpenAIResponsesRequestToLLM(t *testing.T) {

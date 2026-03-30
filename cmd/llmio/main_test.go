@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"testing"
@@ -33,5 +34,11 @@ func TestServeServerGracefulShutdown(t *testing.T) {
 		return server.Serve(listener)
 	}); err != nil {
 		t.Fatalf("serveServer() error = %v", err)
+	}
+}
+
+func TestParseLogLevelDebug(t *testing.T) {
+	if got := parseLogLevel("debug"); got.Level() != slog.LevelDebug {
+		t.Fatalf("log level = %v", got.Level())
 	}
 }

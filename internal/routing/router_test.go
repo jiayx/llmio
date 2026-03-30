@@ -18,7 +18,7 @@ func TestRouterResolveAndModelInfos(t *testing.T) {
 			},
 			{
 				ExternalModel: "a-model",
-				Targets:       []config.Target{{Provider: "p2", BackendModel: "backend-a"}},
+				Targets:       []config.Target{{Provider: "p2", BackendModel: "backend-a", IgnoreRequestFields: []string{"temperature"}}},
 			},
 		},
 	}, map[string]providerapi.ProviderAdapter{
@@ -34,6 +34,9 @@ func TestRouterResolveAndModelInfos(t *testing.T) {
 		t.Fatalf("Resolve() did not find model")
 	}
 	if len(route.Targets) != 1 || route.Targets[0].ProviderName != "p2" {
+		t.Fatalf("route = %#v", route)
+	}
+	if len(route.Targets[0].IgnoreRequestFields) != 1 || route.Targets[0].IgnoreRequestFields[0] != "temperature" {
 		t.Fatalf("route = %#v", route)
 	}
 

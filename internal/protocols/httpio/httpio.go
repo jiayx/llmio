@@ -1,7 +1,6 @@
 package httpio
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,9 +11,15 @@ import (
 
 // WriteJSON writes a JSON response with the given status.
 func WriteJSON(w http.ResponseWriter, status int, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("marshal json response", "status", status, "err", err)
+		data = []byte(`{"error":"internal server error"}`)
+		status = http.StatusInternalServerError
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(append(data, '\n'))
 }
 
 // WriteSSE writes one SSE frame.
@@ -92,20 +97,84 @@ func rewritePassthroughJSON(w io.Writer, body io.Reader, rewrite func([]byte) ([
 }
 
 func rewritePassthroughSSE(w io.Writer, flusher http.Flusher, body io.Reader, rewrite func([]byte) ([]byte, error)) {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "data:") && rewrite != nil {
-			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if payload != "" && payload != "[DONE]" {
-				if rewritten, err := rewrite([]byte(payload)); err == nil {
-					line = "data: " + string(rewritten)
-				}
-			}
-		}
-		_, _ = io.WriteString(w, line+"\n")
-		flusher.Flush()
+	lines, err := readSSELines(body)
+	if err != nil {
+		slog.Warn("read passthrough sse", "err", err)
 	}
+
+	block := make([]string, 0, 8)
+	flushBlock := func() {
+		if len(block) == 0 {
+			return
+		}
+		for _, line := range rewriteSSEBlock(block, rewrite) {
+			_, _ = io.WriteString(w, line+"\n")
+		}
+		_, _ = io.WriteString(w, "\n")
+		flusher.Flush()
+		block = block[:0]
+	}
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			flushBlock()
+			continue
+		}
+		block = append(block, line)
+	}
+	if len(block) > 0 {
+		flushBlock()
+	}
+}
+
+func readSSELines(body io.Reader) ([]string, error) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return strings.Split(text, "\n"), nil
+}
+
+func rewriteSSEBlock(lines []string, rewrite func([]byte) ([]byte, error)) []string {
+	if rewrite == nil {
+		return lines
+	}
+
+	dataLines := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if len(dataLines) == 0 {
+		return lines
+	}
+
+	payload := strings.Join(dataLines, "\n")
+	if payload == "" || payload == "[DONE]" {
+		return lines
+	}
+
+	rewritten, err := rewrite([]byte(payload))
+	if err != nil {
+		return lines
+	}
+
+	out := make([]string, 0, len(lines)-len(dataLines)+1)
+	emittedData := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			if !emittedData {
+				for _, rewrittenLine := range strings.Split(string(rewritten), "\n") {
+					out = append(out, "data: "+rewrittenLine)
+				}
+				emittedData = true
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }

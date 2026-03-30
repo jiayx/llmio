@@ -12,18 +12,24 @@ import (
 	"time"
 
 	"github.com/jiayx/llmio/internal/app"
+	"github.com/jiayx/llmio/internal/config"
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: parseLogLevel(os.Getenv("LLMIO_LOG_LEVEL")),
-	}))
-	slog.SetDefault(logger)
+	if err := config.LoadEnv(); err != nil {
+		_, _ = os.Stderr.WriteString("load .env: " + err.Error() + "\n")
+		os.Exit(1)
+	}
 
 	configPath := os.Getenv("LLMIO_CONFIG")
 	if configPath == "" {
 		configPath = "llmio.json"
 	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: parseLogLevel(os.Getenv("LLMIO_LOG_LEVEL")),
+	}))
+	slog.SetDefault(logger)
 
 	application, err := app.Bootstrap(configPath)
 	if err != nil {

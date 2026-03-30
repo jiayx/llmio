@@ -10,8 +10,9 @@ import (
 
 // Target is one candidate backend for an external model.
 type Target struct {
-	ProviderName string
-	BackendModel string
+	ProviderName        string
+	BackendModel        string
+	IgnoreRequestFields []string
 }
 
 // Route maps one external model to ordered backend targets.
@@ -42,8 +43,9 @@ func New(cfg *config.Config, adapters map[string]providerapi.ProviderAdapter) (*
 				return nil, fmt.Errorf("model route %q references unknown provider %q", route.ExternalModel, target.Provider)
 			}
 			targets = append(targets, Target{
-				ProviderName: target.Provider,
-				BackendModel: target.BackendModel,
+				ProviderName:        target.Provider,
+				BackendModel:        target.BackendModel,
+				IgnoreRequestFields: append([]string(nil), target.IgnoreRequestFields...),
 			})
 		}
 		r.routes[route.ExternalModel] = Route{

@@ -34,7 +34,10 @@ type ChatCompletionResponse struct {
 	Model   string           `json:"model"`
 	Choices []Choice         `json:"choices"`
 	Usage   *CompletionUsage `json:"usage,omitempty"`
-	Error   *CompletionError `json:"error,omitempty"`
+}
+
+type ErrorResponse struct {
+	Error *CompletionError `json:"error"`
 }
 
 type Choice struct {
@@ -54,9 +57,9 @@ type StreamChunk struct {
 }
 
 type StreamChoice struct {
-	Index        int         `json:"index"`
-	Delta        StreamDelta `json:"delta"`
-	FinishReason string      `json:"finish_reason"`
+	Index        int              `json:"index"`
+	Delta        StreamDelta      `json:"delta"`
+	FinishReason string           `json:"finish_reason,omitempty"`
 	Usage        *CompletionUsage `json:"usage,omitempty"`
 }
 
@@ -114,7 +117,6 @@ type ResponsesResponse struct {
 	Output     []ResponseOutputItem `json:"output"`
 	OutputText string               `json:"output_text,omitempty"`
 	Usage      *ResponseUsage       `json:"usage,omitempty"`
-	Error      *CompletionError     `json:"error,omitempty"`
 }
 
 type ResponseOutputItem struct {

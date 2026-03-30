@@ -97,7 +97,7 @@ func (p *Policy) ExecuteChat(ctx context.Context, route routing.Route, req llm.C
 			continue
 		}
 
-		providerReq := req
+		providerReq := sanitizeChatRequest(req, target)
 		providerReq.Model = target.BackendModel
 		attemptCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
 		resp, err := p.providers[target.ProviderName].Chat(attemptCtx, providerReq)
@@ -130,7 +130,7 @@ func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm
 			continue
 		}
 
-		providerReq := req
+		providerReq := sanitizeChatRequest(req, target)
 		providerReq.Model = target.BackendModel
 		attemptCtx, cancel := context.WithCancel(ctx)
 		type streamResult struct {
@@ -212,15 +212,15 @@ func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, me
 			continue
 		}
 
-		payload, err := rewriteRequestModel(meta.Body, target.BackendModel)
+		payload, err := rewriteRequestForTarget(meta.Body, target)
 		if err != nil {
 			return nil, true, err
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, p.timeoutFor(meta.Stream))
 		resp, err := forwarder.Forward(attemptCtx, meta.Protocol, meta.UpstreamPath, payload, meta.Headers)
-		cancel()
 		if err != nil {
+			cancel()
 			p.markFailure(target.ProviderName)
 			if IsRetryableError(err) {
 				continue
@@ -228,16 +228,19 @@ func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, me
 			return nil, true, fmt.Errorf("provider %s: %w", target.ProviderName, err)
 		}
 		if IsUnsupportedPassthroughStatus(resp.StatusCode) {
+			cancel()
 			p.markFailure(target.ProviderName)
 			closeResponseBody("passthrough unsupported", resp.Body)
 			continue
 		}
 		if IsRetryableStatus(resp.StatusCode) {
+			cancel()
 			p.markFailure(target.ProviderName)
 			closeResponseBody("passthrough retry", resp.Body)
 			continue
 		}
 
+		resp.Body = newCancelOnCloseBody(resp.Body, cancel)
 		p.markSuccess(target.ProviderName)
 		p.attachPassthroughUsage(ctx, target, meta, resp)
 		return resp, true, nil
@@ -439,6 +442,12 @@ type passthroughUsageBody struct {
 	failed       bool
 }
 
+type cancelOnCloseBody struct {
+	body   io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
 func newPassthroughUsageBody(body io.ReadCloser, record func(usage.Event), target routing.Target, meta protocols.RequestMeta) io.ReadCloser {
 	return &passthroughUsageBody{
 		body:       body,
@@ -447,6 +456,33 @@ func newPassthroughUsageBody(body io.ReadCloser, record func(usage.Event), targe
 		meta:       meta,
 		blockState: make(map[int]protocolanthropic.ContentBlock),
 	}
+}
+
+func newCancelOnCloseBody(body io.ReadCloser, cancel context.CancelFunc) io.ReadCloser {
+	if cancel == nil {
+		return body
+	}
+	if body == nil {
+		cancel()
+		return nil
+	}
+	return &cancelOnCloseBody{
+		body:   body,
+		cancel: cancel,
+	}
+}
+
+func (b *cancelOnCloseBody) Read(p []byte) (int, error) {
+	return b.body.Read(p)
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	var err error
+	b.once.Do(func() {
+		err = b.body.Close()
+		b.cancel()
+	})
+	return err
 }
 
 func (b *passthroughUsageBody) Read(p []byte) (int, error) {
@@ -675,17 +711,66 @@ func (p *Policy) breaker(provider string) *breakerState {
 	return state
 }
 
-func rewriteRequestModel(body []byte, backendModel string) ([]byte, error) {
+func sanitizeChatRequest(req llm.ChatRequest, target routing.Target) llm.ChatRequest {
+	if len(target.IgnoreRequestFields) == 0 {
+		return req
+	}
+	out := req
+	for _, field := range target.IgnoreRequestFields {
+		switch canonicalRequestField(field) {
+		case "temperature":
+			out.Temperature = nil
+		case "top_p":
+			out.TopP = nil
+		case "max_tokens":
+			out.MaxTokens = 0
+		}
+	}
+	return out
+}
+
+func rewriteRequestForTarget(body []byte, target routing.Target) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("invalid json: %w", err)
 	}
-	payload["model"] = backendModel
+	payload["model"] = target.BackendModel
+	for _, field := range target.IgnoreRequestFields {
+		for _, alias := range requestFieldAliases(field) {
+			delete(payload, alias)
+		}
+	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 	return out, nil
+}
+
+func canonicalRequestField(field string) string {
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "max_output_tokens":
+		return "max_tokens"
+	default:
+		return strings.ToLower(strings.TrimSpace(field))
+	}
+}
+
+func requestFieldAliases(field string) []string {
+	switch canonicalRequestField(field) {
+	case "max_tokens":
+		return []string{"max_tokens", "max_output_tokens"}
+	case "temperature":
+		return []string{"temperature"}
+	case "top_p":
+		return []string{"top_p"}
+	default:
+		canonical := canonicalRequestField(field)
+		if canonical == "" {
+			return nil
+		}
+		return []string{canonical}
+	}
 }
 
 func closeResponseBody(scope string, body interface{ Close() error }) {
