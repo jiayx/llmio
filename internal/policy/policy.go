@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/jiayx/llmio/internal/apikeys"
-	"github.com/jiayx/llmio/internal/debugtrace"
 	"github.com/jiayx/llmio/internal/llm"
+	"github.com/jiayx/llmio/internal/observability"
 	protocols "github.com/jiayx/llmio/internal/protocols"
 	protocolanthropic "github.com/jiayx/llmio/internal/protocols/anthropic"
 	protocolopenai "github.com/jiayx/llmio/internal/protocols/openai"
@@ -92,15 +92,16 @@ func NewWithRecorder(cfg Config, adapters map[string]providerapi.ProviderAdapter
 func (p *Policy) ExecuteChat(ctx context.Context, route routing.Route, req llm.ChatRequest) (*llm.ChatResponse, error) {
 	var lastErr error
 	for _, target := range route.Targets {
+		provider := p.providers[target.ProviderName]
 		if !p.allow(target.ProviderName) {
 			lastErr = fmt.Errorf("provider %s: circuit open", target.ProviderName)
 			continue
 		}
 
-		providerReq := sanitizeChatRequest(req, target)
-		providerReq.Model = target.BackendModel
+		providerReq := prepareChatRequestForTarget(req, target, provider)
+		logNormalizedDispatch(ctx, "chat", provider, target, req.Model, providerReq)
 		attemptCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
-		resp, err := p.providers[target.ProviderName].Chat(attemptCtx, providerReq)
+		resp, err := provider.Chat(attemptCtx, providerReq)
 		cancel()
 		if err == nil {
 			p.markSuccess(target.ProviderName)
@@ -125,13 +126,14 @@ func (p *Policy) ExecuteChat(ctx context.Context, route routing.Route, req llm.C
 func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm.ChatRequest) (*providerapi.StreamReader, error) {
 	var lastErr error
 	for _, target := range route.Targets {
+		provider := p.providers[target.ProviderName]
 		if !p.allow(target.ProviderName) {
 			lastErr = fmt.Errorf("provider %s: circuit open", target.ProviderName)
 			continue
 		}
 
-		providerReq := sanitizeChatRequest(req, target)
-		providerReq.Model = target.BackendModel
+		providerReq := prepareChatRequestForTarget(req, target, provider)
+		logNormalizedDispatch(ctx, "stream", provider, target, req.Model, providerReq)
 		attemptCtx, cancel := context.WithCancel(ctx)
 		type streamResult struct {
 			stream *providerapi.StreamReader
@@ -139,7 +141,7 @@ func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm
 		}
 		resultCh := make(chan streamResult, 1)
 		go func() {
-			stream, err := p.providers[target.ProviderName].ChatStream(attemptCtx, providerReq)
+			stream, err := provider.ChatStream(attemptCtx, providerReq)
 			resultCh <- streamResult{stream: stream, err: err}
 		}()
 
@@ -216,6 +218,7 @@ func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, me
 		if err != nil {
 			return nil, true, err
 		}
+		logPassthroughDispatch(ctx, meta, target, payload)
 
 		attemptCtx, cancel := context.WithTimeout(ctx, p.timeoutFor(meta.Stream))
 		resp, err := forwarder.Forward(attemptCtx, meta.Protocol, meta.UpstreamPath, payload, meta.Headers)
@@ -275,7 +278,7 @@ func (p *Policy) wrapStreamUsage(ctx context.Context, target routing.Target, ext
 					input = event.InputTokens
 					output = event.OutputTokens
 					usageKnown = true
-					if debugtrace.Enabled() {
+					if observability.Enabled() {
 						slog.Debug("usage stream event trace",
 							"provider", target.ProviderName,
 							"external_model", externalModel,
@@ -329,12 +332,12 @@ func (p *Policy) attachPassthroughUsage(ctx context.Context, target routing.Targ
 	resp.Body = io.NopCloser(bytes.NewReader(data))
 
 	input, output, known := extractPassthroughUsage(meta, data)
-	if debugtrace.Enabled() {
+	if observability.Enabled() {
 		slog.Debug("usage passthrough body trace",
 			"provider", target.ProviderName,
 			"protocol", meta.Protocol,
 			"api_type", meta.APIType,
-			"body", debugtrace.Bytes(data),
+			"body", observability.Bytes(data),
 			"input_tokens", input,
 			"output_tokens", output,
 			"usage_known", known,
@@ -404,7 +407,7 @@ func (p *Policy) recordUsage(ctx context.Context, target routing.Target, externa
 }
 
 func (p *Policy) recordUsageEvent(ctx context.Context, event usage.Event) {
-	if debugtrace.Enabled() {
+	if observability.Enabled() {
 		slog.Debug("usage record trace",
 			"api_key_id", event.APIKeyID,
 			"api_key_name", event.APIKeyName,
@@ -544,19 +547,19 @@ func (b *passthroughUsageBody) consumeLine(line string) {
 		case protocols.APIChatCompletions:
 			events, err := protocolopenai.StreamChunkPayloadToLLMEvents(payload)
 			if err == nil {
-				if debugtrace.Enabled() {
+				if observability.Enabled() {
 					slog.Debug("usage passthrough openai stream trace",
 						"api_type", b.meta.APIType,
-						"payload", debugtrace.String(payload),
+						"payload", observability.String(payload),
 					)
 				}
 				b.observeEvents(events)
 			}
 		case protocols.APIResponses:
 			if event, ok := openAIResponsesUsageEvent(payload); ok {
-				if debugtrace.Enabled() {
+				if observability.Enabled() {
 					slog.Debug("usage passthrough responses stream trace",
-						"payload", debugtrace.String(payload),
+						"payload", observability.String(payload),
 						"input_tokens", event.InputTokens,
 						"output_tokens", event.OutputTokens,
 					)
@@ -729,6 +732,30 @@ func sanitizeChatRequest(req llm.ChatRequest, target routing.Target) llm.ChatReq
 	return out
 }
 
+func prepareChatRequestForTarget(req llm.ChatRequest, target routing.Target, provider providerapi.ProviderAdapter) llm.ChatRequest {
+	out := sanitizeChatRequest(req, target)
+	out.Model = target.BackendModel
+	if modeForNormalizedDispatch(provider, req.SourceProtocol) != "same_protocol_transform" || len(req.RawRequestBody) == 0 {
+		out.RawRequestBody = nil
+		return out
+	}
+	rewritten, err := rewriteRequestForTarget(req.RawRequestBody, target)
+	if err != nil {
+		slog.Debug("rewrite raw request for normalized dispatch failed",
+			"provider", target.ProviderName,
+			"external_model", req.Model,
+			"backend_model", target.BackendModel,
+			"source_protocol", req.SourceProtocol,
+			"source_api_type", req.SourceAPIType,
+			"err", err,
+		)
+		out.RawRequestBody = nil
+		return out
+	}
+	out.RawRequestBody = rewritten
+	return out
+}
+
 func rewriteRequestForTarget(body []byte, target routing.Target) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -771,6 +798,72 @@ func requestFieldAliases(field string) []string {
 		}
 		return []string{canonical}
 	}
+}
+
+func modeForNormalizedDispatch(provider providerapi.ProviderAdapter, sourceProtocol string) string {
+	reporter, ok := provider.(providerapi.NativeProtocolReporter)
+	if !ok || sourceProtocol == "" {
+		return "protocol_conversion"
+	}
+	if reporter.NativeProtocol() == sourceProtocol {
+		return "same_protocol_transform"
+	}
+	return "cross_protocol_transform"
+}
+
+func logNormalizedDispatch(ctx context.Context, operation string, provider providerapi.ProviderAdapter, target routing.Target, externalModel string, req llm.ChatRequest) {
+	if !observability.Enabled() {
+		return
+	}
+	requestID := observability.RequestIDFromContext(ctx)
+	mode := modeForNormalizedDispatch(provider, req.SourceProtocol)
+	body := req.RawRequestBody
+	if len(body) == 0 {
+		data, err := json.Marshal(req)
+		if err != nil {
+			slog.Debug("gateway dispatch trace",
+				"request_id", requestID,
+				"mode", mode,
+				"operation", operation,
+				"provider", target.ProviderName,
+				"external_model", externalModel,
+				"backend_model", target.BackendModel,
+				"source_protocol", req.SourceProtocol,
+				"source_api_type", req.SourceAPIType,
+				"marshal_error", err,
+			)
+			return
+		}
+		body = data
+	}
+	slog.Debug("gateway dispatch trace",
+		"request_id", requestID,
+		"mode", mode,
+		"operation", operation,
+		"provider", target.ProviderName,
+		"external_model", externalModel,
+		"backend_model", target.BackendModel,
+		"source_protocol", req.SourceProtocol,
+		"source_api_type", req.SourceAPIType,
+		"request_body", observability.Bytes(body),
+	)
+}
+
+func logPassthroughDispatch(ctx context.Context, meta protocols.RequestMeta, target routing.Target, payload []byte) {
+	if !observability.Enabled() {
+		return
+	}
+	slog.Debug("gateway dispatch trace",
+		"request_id", observability.RequestIDFromContext(ctx),
+		"mode", "passthrough",
+		"protocol", meta.Protocol,
+		"api_type", meta.APIType,
+		"provider", target.ProviderName,
+		"external_model", meta.ExternalModel,
+		"backend_model", target.BackendModel,
+		"upstream_path", meta.UpstreamPath,
+		"request_body", observability.Bytes(payload),
+	)
 }
 
 func closeResponseBody(scope string, body interface{ Close() error }) {

@@ -85,6 +85,41 @@ func TestExecuteChatStripsIgnoredRequestFields(t *testing.T) {
 	}
 }
 
+func TestExecuteChatUsesRewrittenRawBodyForSameProtocolTransform(t *testing.T) {
+	primary := &policyStubProvider{
+		chatResp:       &llm.ChatResponse{ID: "ok"},
+		nativeProtocol: "openai",
+	}
+	p := New(DefaultConfig(), map[string]providerapi.ProviderAdapter{
+		"primary": primary,
+	})
+
+	_, err := p.ExecuteChat(context.Background(), routing.Route{
+		Targets: []routing.Target{{
+			ProviderName:        "primary",
+			BackendModel:        "kimi-k2.5",
+			IgnoreRequestFields: []string{"temperature"},
+		}},
+	}, llm.ChatRequest{
+		Model:          "proxy-model",
+		SourceProtocol: "openai",
+		SourceAPIType:  "chat_completions",
+		RawRequestBody: []byte(`{"model":"proxy-model","temperature":0.7,"reasoning_content":"think first","vendor_field":{"x":1}}`),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteChat() error = %v", err)
+	}
+	if !bytes.Contains(primary.lastChatReq.RawRequestBody, []byte(`"model":"kimi-k2.5"`)) {
+		t.Fatalf("raw = %s", string(primary.lastChatReq.RawRequestBody))
+	}
+	if bytes.Contains(primary.lastChatReq.RawRequestBody, []byte(`"temperature"`)) {
+		t.Fatalf("raw = %s", string(primary.lastChatReq.RawRequestBody))
+	}
+	if !bytes.Contains(primary.lastChatReq.RawRequestBody, []byte(`"vendor_field":{"x":1}`)) {
+		t.Fatalf("raw = %s", string(primary.lastChatReq.RawRequestBody))
+	}
+}
+
 func TestExecutePassthroughUsesBreakerAfterRetryableFailures(t *testing.T) {
 	primary := &policyStubProvider{
 		statuses: []int{http.StatusServiceUnavailable},
@@ -483,13 +518,14 @@ func TestExecuteStreamRecordsUsageOnGracefulEOFWithoutStopEvent(t *testing.T) {
 }
 
 type policyStubProvider struct {
-	chatResp      *llm.ChatResponse
-	chatErr       error
-	lastChatReq   llm.ChatRequest
-	stream        *providerapi.StreamReader
-	streamErr     error
-	streamFactory func(context.Context, llm.ChatRequest) (*providerapi.StreamReader, error)
-	forwardFunc   func(context.Context, string, string, []byte, http.Header) (*http.Response, error)
+	chatResp       *llm.ChatResponse
+	chatErr        error
+	lastChatReq    llm.ChatRequest
+	nativeProtocol string
+	stream         *providerapi.StreamReader
+	streamErr      error
+	streamFactory  func(context.Context, llm.ChatRequest) (*providerapi.StreamReader, error)
+	forwardFunc    func(context.Context, string, string, []byte, http.Header) (*http.Response, error)
 
 	statuses        []int
 	forwardCalls    int
@@ -497,6 +533,8 @@ type policyStubProvider struct {
 }
 
 func (p policyStubProvider) Name() string { return "stub" }
+
+func (p *policyStubProvider) NativeProtocol() string { return p.nativeProtocol }
 
 func (p *policyStubProvider) Chat(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 	p.lastChatReq = req

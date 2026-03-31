@@ -17,6 +17,11 @@ type ChatProvider interface {
 // ProviderAdapter is the backend-facing adapter contract used by the gateway.
 type ProviderAdapter = ChatProvider
 
+// NativeProtocolReporter reports the provider's native request protocol family.
+type NativeProtocolReporter interface {
+	NativeProtocol() string
+}
+
 // OpenAIPassthroughProvider forwards native OpenAI-compatible requests.
 type OpenAIPassthroughProvider interface {
 	ForwardOpenAI(ctx context.Context, upstreamPath string, body []byte, headers http.Header) (*http.Response, error)

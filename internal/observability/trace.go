@@ -1,4 +1,4 @@
-package debugtrace
+package observability
 
 import (
 	"os"

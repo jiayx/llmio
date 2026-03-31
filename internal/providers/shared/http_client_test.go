@@ -1,16 +1,31 @@
 package providershared
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
 
-func TestTraceReadCloserPreservesBody(t *testing.T) {
-	rc := newTraceReadCloser(io.NopCloser(strings.NewReader(`{"ok":true}`)), http.MethodPost, "https://example.com/v1/chat/completions", http.StatusOK, "application/json")
+func TestHTTPClientDoPreservesResponseBody(t *testing.T) {
+	client := NewHTTPClient("http://example.com", nil, &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		}),
+	}, nil)
 
-	data, err := io.ReadAll(rc)
+	resp, err := client.Do(context.Background(), http.MethodPost, "/v1/chat/completions", []byte(`{"hello":"world"}`), nil)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll() error = %v", err)
 	}
@@ -19,18 +34,8 @@ func TestTraceReadCloserPreservesBody(t *testing.T) {
 	}
 }
 
-func TestRedactHeaders(t *testing.T) {
-	headers := http.Header{
-		"Authorization": []string{"Bearer secret"},
-		"X-API-Key":     []string{"secret"},
-		"Content-Type":  []string{"application/json"},
-	}
+type roundTripperFunc func(*http.Request) (*http.Response, error)
 
-	got := redactHeaders(headers)
-	if got["Authorization"][0] != "[REDACTED]" || got["X-API-Key"][0] != "[REDACTED]" {
-		t.Fatalf("headers = %#v", got)
-	}
-	if got["Content-Type"][0] != "application/json" {
-		t.Fatalf("headers = %#v", got)
-	}
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

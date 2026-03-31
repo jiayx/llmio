@@ -2,16 +2,19 @@ package llm
 
 // ChatRequest is the normalized request shape shared across providers.
 type ChatRequest struct {
-	Model       string
-	Messages    []Message
-	System      []ContentPart
-	MaxTokens   int
-	Temperature *float64
-	TopP        *float64
-	Stream      bool
-	User        string
-	Tools       []ToolDefinition
-	ToolChoice  *ToolChoice
+	Model          string
+	Messages       []Message
+	System         []ContentPart
+	MaxTokens      int
+	Temperature    *float64
+	TopP           *float64
+	Stream         bool
+	User           string
+	Tools          []ToolDefinition
+	ToolChoice     *ToolChoice
+	SourceProtocol string
+	SourceAPIType  string
+	RawRequestBody []byte
 }
 
 // Message is a single chat message in normalized form.

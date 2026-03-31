@@ -11,8 +11,8 @@ import (
 	"strings"
 
 	"github.com/jiayx/llmio/internal/config"
-	"github.com/jiayx/llmio/internal/debugtrace"
 	"github.com/jiayx/llmio/internal/llm"
+	"github.com/jiayx/llmio/internal/observability"
 	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	providershared "github.com/jiayx/llmio/internal/providers/shared"
@@ -45,6 +45,11 @@ func (p *OpenAICompatible) Name() string {
 	return p.name
 }
 
+// NativeProtocol reports the provider's native protocol family.
+func (p *OpenAICompatible) NativeProtocol() string {
+	return "openai"
+}
+
 // SupportsOpenAIAPI reports whether a native OpenAI API type should use passthrough.
 func (p *OpenAICompatible) SupportsOpenAIAPI(apiType string) bool {
 	return providershared.SupportsAPIType(p.supported, apiType)
@@ -70,9 +75,13 @@ func (p *OpenAICompatible) Forward(ctx context.Context, protocol, path string, b
 
 // Chat executes a normalized non-streaming chat request.
 func (p *OpenAICompatible) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
-	payload, err := json.Marshal(llmToOpenAI(req))
-	if err != nil {
-		return nil, fmt.Errorf("marshal openai request: %w", err)
+	payload := req.RawRequestBody
+	if !canUseNativeOpenAIChatRequest(req) {
+		var err error
+		payload, err = json.Marshal(llmToOpenAI(req))
+		if err != nil {
+			return nil, fmt.Errorf("marshal openai request: %w", err)
+		}
 	}
 
 	resp, err := p.httpClient.Do(ctx, http.MethodPost, "/chat/completions", payload, nil)
@@ -85,11 +94,11 @@ func (p *OpenAICompatible) Chat(ctx context.Context, req llm.ChatRequest) (*llm.
 	if err != nil {
 		return nil, fmt.Errorf("read provider response: %w", err)
 	}
-	if debugtrace.Enabled() {
+	if observability.Enabled() {
 		slog.Debug("openai provider response body trace",
 			"provider", p.name,
 			"path", "/chat/completions",
-			"body", debugtrace.Bytes(data),
+			"body", observability.Bytes(data),
 		)
 	}
 	if resp.StatusCode >= 400 {
@@ -106,12 +115,16 @@ func (p *OpenAICompatible) Chat(ctx context.Context, req llm.ChatRequest) (*llm.
 
 // ChatStream executes a normalized streaming chat request.
 func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) (*providerapi.StreamReader, error) {
-	payload := llmToOpenAI(req)
-	payload.Stream = true
+	body := req.RawRequestBody
+	if !canUseNativeOpenAIChatRequest(req) {
+		payload := llmToOpenAI(req)
+		payload.Stream = true
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal openai request: %w", err)
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal openai request: %w", err)
+		}
 	}
 
 	resp, err := p.httpClient.Do(ctx, http.MethodPost, "/chat/completions", body, nil)
@@ -145,11 +158,11 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 			}
 
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if debugtrace.Enabled() {
+			if observability.Enabled() {
 				slog.Debug("openai provider stream chunk trace",
 					"provider", p.name,
 					"path", "/chat/completions",
-					"payload", debugtrace.String(payload),
+					"payload", observability.String(payload),
 				)
 			}
 			if payload == "[DONE]" {
@@ -167,11 +180,11 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 				return
 			}
 			for _, event := range streamEvents {
-				if debugtrace.Enabled() {
+				if observability.Enabled() {
 					slog.Debug("openai provider stream event trace",
 						"provider", p.name,
 						"type", event.Type,
-						"text_delta", debugtrace.String(event.TextDelta),
+						"text_delta", observability.String(event.TextDelta),
 						"input_tokens", event.InputTokens,
 						"output_tokens", event.OutputTokens,
 						"finish_reason", event.FinishReason,
@@ -200,4 +213,8 @@ func (p *OpenAICompatible) ChatStream(ctx context.Context, req llm.ChatRequest) 
 		Err:    errs,
 		Close:  resp.Body.Close,
 	}, nil
+}
+
+func canUseNativeOpenAIChatRequest(req llm.ChatRequest) bool {
+	return req.SourceProtocol == "openai" && req.SourceAPIType == "chat_completions" && len(req.RawRequestBody) > 0
 }

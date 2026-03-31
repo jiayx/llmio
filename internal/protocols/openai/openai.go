@@ -69,14 +69,14 @@ func WriteModels(w http.ResponseWriter, infos []routing.ModelInfo) {
 // WriteChatCompletionResponse writes one normalized response as OpenAI chat completions JSON.
 func WriteChatCompletionResponse(w http.ResponseWriter, externalModel string, resp *llm.ChatResponse) {
 	parts := resp.EffectiveOutput()
-	content, toolCalls := llmContentToOpenAI(parts)
+	content, toolCalls, reasoningContent := llmContentToOpenAI(parts)
 	created := time.Now().Unix()
 	httpio.WriteJSON(w, http.StatusOK, ChatCompletionResponse{
 		ID:      resp.ID,
 		Object:  "chat.completion",
 		Created: created,
 		Model:   externalModel,
-		Choices: []Choice{{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls}, FinishReason: resp.FinishReason}},
+		Choices: []Choice{{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls, ReasoningContent: reasoningContent}, FinishReason: resp.FinishReason}},
 		Usage: &CompletionUsage{
 			PromptTokens:     resp.InputTokens,
 			CompletionTokens: resp.OutputTokens,
@@ -467,9 +467,10 @@ func responseOutputItems(parts []llm.ContentPart) []ResponseOutputItem {
 	return items
 }
 
-func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall) {
+func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall, string) {
 	var content []map[string]any
 	var toolCalls []ToolCall
+	var reasoningParts []string
 	for _, part := range parts {
 		switch part.Type {
 		case llm.ContentTypeText:
@@ -477,6 +478,10 @@ func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall) {
 		case llm.ContentTypeImage:
 			if part.URL != "" {
 				content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.URL}})
+			}
+		case llm.ContentTypeReasoning:
+			if strings.TrimSpace(part.Text) != "" {
+				reasoningParts = append(reasoningParts, part.Text)
 			}
 		case llm.ContentTypeToolCall:
 			toolCalls = append(toolCalls, ToolCall{
@@ -489,17 +494,18 @@ func llmContentToOpenAI(parts []llm.ContentPart) (any, []ToolCall) {
 			})
 		}
 	}
+	reasoningContent := strings.Join(reasoningParts, "\n")
 	if len(content) == 0 {
-		return nil, toolCalls
+		return nil, toolCalls, reasoningContent
 	}
 	if len(content) == 1 && content[0]["type"] == "text" {
-		return content[0]["text"], toolCalls
+		return content[0]["text"], toolCalls, reasoningContent
 	}
 	out := make([]any, 0, len(content))
 	for _, item := range content {
 		out = append(out, item)
 	}
-	return out, toolCalls
+	return out, toolCalls, reasoningContent
 }
 
 func streamObjectID(prefix string) string {

@@ -42,6 +42,11 @@ func (p *AnthropicNative) Name() string {
 	return p.name
 }
 
+// NativeProtocol reports the provider's native protocol family.
+func (p *AnthropicNative) NativeProtocol() string {
+	return "anthropic"
+}
+
 // SupportsAnthropicAPI reports whether a native Anthropic API type should use passthrough.
 func (p *AnthropicNative) SupportsAnthropicAPI(apiType string) bool {
 	return providershared.SupportsAPIType(p.supported, apiType)
@@ -67,9 +72,13 @@ func (p *AnthropicNative) Forward(ctx context.Context, protocol, path string, bo
 
 // Chat executes a normalized non-streaming chat request.
 func (p *AnthropicNative) Chat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
-	payload, err := json.Marshal(llmToAnthropic(req))
-	if err != nil {
-		return nil, fmt.Errorf("marshal anthropic request: %w", err)
+	payload := req.RawRequestBody
+	if !canUseNativeAnthropicMessagesRequest(req) {
+		var err error
+		payload, err = json.Marshal(llmToAnthropic(req))
+		if err != nil {
+			return nil, fmt.Errorf("marshal anthropic request: %w", err)
+		}
 	}
 
 	resp, err := p.httpClient.Do(ctx, http.MethodPost, "/messages", payload, nil)
@@ -96,12 +105,16 @@ func (p *AnthropicNative) Chat(ctx context.Context, req llm.ChatRequest) (*llm.C
 
 // ChatStream executes a normalized streaming chat request.
 func (p *AnthropicNative) ChatStream(ctx context.Context, req llm.ChatRequest) (*providerapi.StreamReader, error) {
-	payload := llmToAnthropic(req)
-	payload.Stream = true
+	body := req.RawRequestBody
+	if !canUseNativeAnthropicMessagesRequest(req) {
+		payload := llmToAnthropic(req)
+		payload.Stream = true
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal anthropic request: %w", err)
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal anthropic request: %w", err)
+		}
 	}
 
 	resp, err := p.httpClient.Do(ctx, http.MethodPost, "/messages", body, nil)
@@ -164,4 +177,8 @@ func (p *AnthropicNative) ChatStream(ctx context.Context, req llm.ChatRequest) (
 		Err:    errs,
 		Close:  resp.Body.Close,
 	}, nil
+}
+
+func canUseNativeAnthropicMessagesRequest(req llm.ChatRequest) bool {
+	return req.SourceProtocol == "anthropic" && req.SourceAPIType == "messages" && len(req.RawRequestBody) > 0
 }

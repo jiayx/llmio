@@ -80,3 +80,65 @@ func TestWriteChatCompletionResponseToolCallUsesNullContent(t *testing.T) {
 		t.Fatalf("message = %#v", message)
 	}
 }
+
+func TestChatCompletionRequestToLLMPreservesReasoningContent(t *testing.T) {
+	req := ChatCompletionRequest{
+		Model: "kimi-k2.5",
+		Messages: []Message{
+			{
+				Role:             "assistant",
+				ReasoningContent: "think first",
+				ToolCalls: []ToolCall{{
+					ID:   "call_1",
+					Type: "function",
+					Function: FunctionCall{
+						Name:      "lookup",
+						Arguments: `{"q":"hello"}`,
+					},
+				}},
+			},
+		},
+	}
+
+	got, err := ChatCompletionRequestToLLM(req)
+	if err != nil {
+		t.Fatalf("ChatCompletionRequestToLLM() error = %v", err)
+	}
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages = %#v", got.Messages)
+	}
+	parts := got.Messages[0].Content
+	if len(parts) != 2 {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if parts[0].Type != llm.ContentTypeReasoning || parts[0].Text != "think first" {
+		t.Fatalf("parts = %#v", parts)
+	}
+	if parts[1].Type != llm.ContentTypeToolCall || parts[1].Name != "lookup" {
+		t.Fatalf("parts = %#v", parts)
+	}
+}
+
+func TestChatCompletionRequestFromLLMIncludesReasoningContent(t *testing.T) {
+	req := llm.ChatRequest{
+		Model: "kimi-k2.5",
+		Messages: []llm.Message{{
+			Role: "assistant",
+			Content: []llm.ContentPart{
+				{Type: llm.ContentTypeReasoning, Text: "think first"},
+				{Type: llm.ContentTypeToolCall, ToolCallID: "call_1", Name: "lookup", Input: `{"q":"hello"}`},
+			},
+		}},
+	}
+
+	got := ChatCompletionRequestFromLLM(req)
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages = %#v", got.Messages)
+	}
+	if got.Messages[0].ReasoningContent != "think first" {
+		t.Fatalf("message = %#v", got.Messages[0])
+	}
+	if len(got.Messages[0].ToolCalls) != 1 || got.Messages[0].ToolCalls[0].Function.Name != "lookup" {
+		t.Fatalf("message = %#v", got.Messages[0])
+	}
+}

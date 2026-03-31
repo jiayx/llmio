@@ -29,6 +29,9 @@ func ChatCompletionRequestToLLM(req ChatCompletionRequest) (llm.ChatRequest, err
 		if err != nil {
 			return llm.ChatRequest{}, fmt.Errorf("invalid messages[%d]: %w", i, err)
 		}
+		if msg.ReasoningContent != "" {
+			content = append(content, llm.ContentPart{Type: llm.ContentTypeReasoning, Text: msg.ReasoningContent})
+		}
 		if len(msg.ToolCalls) > 0 {
 			content = append(content, openAIToolCallsToLLM(msg.ToolCalls)...)
 		}

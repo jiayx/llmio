@@ -10,11 +10,11 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
-	"time"
 
 	"github.com/jiayx/llmio/internal/apikeys"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
+	"github.com/jiayx/llmio/internal/observability"
 	"github.com/jiayx/llmio/internal/policy"
 	protocols "github.com/jiayx/llmio/internal/protocols"
 	protocolanthropic "github.com/jiayx/llmio/internal/protocols/anthropic"
@@ -87,7 +87,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/api-keys", s.handleAdminAPIKeys)
 	mux.HandleFunc("/admin/api-keys/", s.handleAdminAPIKeyByID)
 	s.registerProtocolRoutes(mux)
-	return s.withRecovery(s.withLogging(s.withAuth(mux)))
+	return observability.Middleware(s.withRecovery(s.withAuth(mux)))
 }
 
 func (s *Server) withAuth(next http.Handler) http.Handler {
@@ -167,29 +167,14 @@ func maskAPIKey(key string) string {
 	return key[:8]
 }
 
-func (s *Server) withLogging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		ww := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		defer func() {
-			slog.Info("request completed",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", ww.status,
-				"duration", time.Since(start).Truncate(time.Millisecond),
-				"remote", r.RemoteAddr,
-			)
-		}()
-		next.ServeHTTP(ww, r)
-	})
-}
-
 func (s *Server) withRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ww := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		requestID := observability.RequestIDFromContext(r.Context())
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				slog.Error("request panic",
+					"request_id", requestID,
 					"method", r.Method,
 					"path", r.URL.Path,
 					"remote", r.RemoteAddr,
@@ -351,6 +336,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	slog.Debug("gateway request decoded",
+		"request_id", observability.RequestIDFromContext(r.Context()),
 		"protocol", "openai",
 		"endpoint", "chat_completions",
 		"external_model", req.Model,
@@ -377,6 +363,9 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		protocolopenai.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	chatReq.SourceProtocol = protocols.ProtocolOpenAI
+	chatReq.SourceAPIType = protocols.APIChatCompletions
+	chatReq.RawRequestBody = append([]byte(nil), body...)
 	if req.Stream {
 		s.handleOpenAIStream(w, r, route, chatReq)
 		return
@@ -415,6 +404,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Debug("gateway request decoded",
+		"request_id", observability.RequestIDFromContext(r.Context()),
 		"protocol", "openai",
 		"endpoint", "responses",
 		"external_model", req.Model,
@@ -441,6 +431,9 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		protocolopenai.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	chatReq.SourceProtocol = protocols.ProtocolOpenAI
+	chatReq.SourceAPIType = protocols.APIResponses
+	chatReq.RawRequestBody = append([]byte(nil), body...)
 
 	if req.Stream {
 		s.handleOpenAIResponsesStream(w, r, req.Model, route, chatReq)
@@ -480,6 +473,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	slog.Debug("gateway request decoded",
+		"request_id", observability.RequestIDFromContext(r.Context()),
 		"protocol", "anthropic",
 		"endpoint", "messages",
 		"external_model", req.Model,
@@ -506,6 +500,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		protocolanthropic.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	chatReq.SourceProtocol = protocols.ProtocolAnthropic
+	chatReq.SourceAPIType = protocols.APIMessages
+	chatReq.RawRequestBody = append([]byte(nil), body...)
 
 	if req.Stream {
 		s.handleAnthropicStream(w, r, req.Model, route, chatReq)

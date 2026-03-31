@@ -11,14 +11,15 @@ import (
 func ChatCompletionRequestFromLLM(req llm.ChatRequest) ChatCompletionRequest {
 	messages := make([]Message, 0, len(req.Messages)+1)
 	if len(req.System) > 0 {
-		systemContent, _ := llmContentToOpenAI(req.System)
+		systemContent, _, systemReasoning := llmContentToOpenAI(req.System)
 		messages = append(messages, Message{
-			Role:    "system",
-			Content: systemContent,
+			Role:             "system",
+			Content:          systemContent,
+			ReasoningContent: systemReasoning,
 		})
 	}
 	for _, msg := range req.Messages {
-		content, toolCalls := llmContentToOpenAI(msg.Content)
+		content, toolCalls, reasoningContent := llmContentToOpenAI(msg.Content)
 		role := msg.Role
 		if role == "user" && llm.HasOnlyContentType(msg.Content, llm.ContentTypeToolResult) {
 			role = "tool"
@@ -35,10 +36,11 @@ func ChatCompletionRequestFromLLM(req llm.ChatRequest) ChatCompletionRequest {
 			continue
 		}
 		messages = append(messages, Message{
-			Role:      role,
-			Content:   content,
-			Name:      msg.Name,
-			ToolCalls: toolCalls,
+			Role:             role,
+			Content:          content,
+			Name:             msg.Name,
+			ToolCalls:        toolCalls,
+			ReasoningContent: reasoningContent,
 		})
 	}
 

@@ -57,6 +57,43 @@ func TestChatStreamDelaysStopUntilAfterTrailingUsage(t *testing.T) {
 	}
 }
 
+func TestChatUsesRawOpenAIRequestBodyForSameProtocolTransform(t *testing.T) {
+	var capturedBody string
+	provider := &OpenAICompatible{
+		name: "moonshot",
+		httpClient: providershared.NewHTTPClient("http://example.com", nil, &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				data, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read request body: %v", err)
+				}
+				capturedBody = string(data)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl-1","object":"chat.completion","model":"kimi-k2.5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)),
+				}, nil
+			}),
+		}, nil),
+	}
+
+	_, err := provider.Chat(context.Background(), llm.ChatRequest{
+		Model:          "kimi-k2.5",
+		SourceProtocol: "openai",
+		SourceAPIType:  "chat_completions",
+		RawRequestBody: []byte(`{"model":"kimi-k2.5","messages":[{"role":"assistant","reasoning_content":"think first","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"hello\"}"}}]}],"vendor_field":{"x":1}}`),
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if !strings.Contains(capturedBody, `"reasoning_content":"think first"`) {
+		t.Fatalf("capturedBody = %s", capturedBody)
+	}
+	if !strings.Contains(capturedBody, `"vendor_field":{"x":1}`) {
+		t.Fatalf("capturedBody = %s", capturedBody)
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
