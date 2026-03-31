@@ -142,8 +142,7 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 	}
 
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    router,
+		router: router,
 		policy: policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
 			Catalog: billing.NewCatalog([]config.PricingRule{{
 				Provider:               "primary",
@@ -317,8 +316,7 @@ func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
 	}
 
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    router,
+		router: router,
 		policy: policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
 			Catalog: billing.NewCatalog([]config.PricingRule{{
 				Provider:          "primary",
@@ -581,8 +579,7 @@ func TestDispatchChatFallback(t *testing.T) {
 		}},
 	}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	resp, err := s.dispatchChat(context.Background(), modelRoute{
@@ -765,8 +762,7 @@ func TestHandleOpenAIResponses(t *testing.T) {
 		}},
 	}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    mustTestRouter(t, providersMap, "gpt-proxy", "primary", "backend-model"),
+		router: mustTestRouter(t, providersMap, "gpt-proxy", "primary", "backend-model"),
 		policy:    policy.New(policy.DefaultConfig(), providersMap),
 	})
 
@@ -903,8 +899,8 @@ func TestNewServerAnthropicNativeProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
-	if _, ok := server.currentSnapshot().providers["anthropic"]; !ok {
-		t.Fatalf("provider not registered")
+	if route, ok := server.resolveRoute("claude-proxy"); !ok || len(route.Targets) != 1 || route.Targets[0].ProviderName != "anthropic" {
+		t.Fatalf("route = %#v ok=%v", route, ok)
 	}
 }
 
@@ -921,8 +917,7 @@ func TestHandleOpenAIChatCompletionsPassthrough(t *testing.T) {
 	}
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
+		router: mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
 		policy:    policy.New(policy.DefaultConfig(), providersMap),
 	})
 
@@ -960,8 +955,7 @@ func TestHandleOpenAIResponsesPassthrough(t *testing.T) {
 	}
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
+		router: mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
 		policy:    policy.New(policy.DefaultConfig(), providersMap),
 	})
 
@@ -991,8 +985,7 @@ func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 	}
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
+		router: mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
 		policy:    policy.New(policy.DefaultConfig(), providersMap),
 	})
 
@@ -1057,8 +1050,7 @@ func TestHandleAnthropicMessagesPassthrough(t *testing.T) {
 	}
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    mustTestRouter(t, providersMap, "claude-proxy", "p", "backend-model"),
+		router: mustTestRouter(t, providersMap, "claude-proxy", "p", "backend-model"),
 		policy:    policy.New(policy.DefaultConfig(), providersMap),
 	})
 
@@ -1109,8 +1101,7 @@ func TestHandleOpenAIStreamToolCall(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
@@ -1129,8 +1120,7 @@ func TestHandleOpenAIStreamReasoning(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
@@ -1149,8 +1139,7 @@ func TestHandleOpenAIResponsesStreamToolCall(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
@@ -1171,8 +1160,7 @@ func TestHandleOpenAIResponsesStreamReasoningAndImage(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
@@ -1198,8 +1186,7 @@ func TestHandleOpenAIResponsesStreamContextCanceledDoesNotWrite502(t *testing.T)
 		},
 	}}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
@@ -1220,8 +1207,7 @@ func TestHandleAnthropicStreamToolCall(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
 	rec := httptest.NewRecorder()
@@ -1241,8 +1227,7 @@ func TestHandleAnthropicStreamImageBlock(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
 	rec := httptest.NewRecorder()
@@ -1261,8 +1246,7 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 	)
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
-		providers: providersMap,
-		router:    mustTestRouter(t, providersMap, "claude-proxy", "p", "x"),
+		router: mustTestRouter(t, providersMap, "claude-proxy", "p", "x"),
 		policy:    policy.New(policy.DefaultConfig(), providersMap),
 	})
 

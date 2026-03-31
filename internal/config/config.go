@@ -48,11 +48,8 @@ type ProviderConfig struct {
 
 // ModelRoute maps one external model name to one or more backend targets.
 type ModelRoute struct {
-	ExternalModel       string   `json:"external_model"`
-	Provider            string   `json:"provider"`
-	BackendModel        string   `json:"backend_model"`
-	IgnoreRequestFields []string `json:"ignore_request_fields,omitempty"`
-	Targets             []Target `json:"targets"`
+	ExternalModel string   `json:"external_model"`
+	Targets       []Target `json:"targets"`
 }
 
 // Target defines a single backend provider/model pair for routing.
@@ -159,17 +156,7 @@ func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
 			return fmt.Errorf("config.model_routes[%d].external_model is required", i)
 		}
 		if len(route.Targets) == 0 {
-			route.Provider = strings.TrimSpace(route.Provider)
-			route.BackendModel = strings.TrimSpace(route.BackendModel)
-			route.IgnoreRequestFields = normalizeRequestFields(route.IgnoreRequestFields)
-			if route.Provider == "" || route.BackendModel == "" {
-				return fmt.Errorf("model route %q requires provider/backend_model or targets", route.ExternalModel)
-			}
-			route.Targets = []Target{{
-				Provider:            route.Provider,
-				BackendModel:        route.BackendModel,
-				IgnoreRequestFields: route.IgnoreRequestFields,
-			}}
+			return fmt.Errorf("model route %q requires at least one target", route.ExternalModel)
 		}
 		for j := range route.Targets {
 			target := &route.Targets[j]

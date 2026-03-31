@@ -32,9 +32,8 @@ type routeTarget = routing.Target
 type modelRoute = routing.Route
 
 type runtimeSnapshot struct {
-	providers map[string]chatProvider
-	router    *routing.Router
-	policy    *policy.Policy
+	router *routing.Router
+	policy *policy.Policy
 }
 
 // Server routes compatible OpenAI and Anthropic requests to configured providers.
@@ -685,9 +684,8 @@ func (s *Server) buildRuntimeSnapshot(doc config.RuntimeConfig) (*runtimeSnapsho
 		Next:    s.apiKeyStore,
 	})
 	return &runtimeSnapshot{
-		providers: providersMap,
-		router:    router,
-		policy:    execPolicy,
+		router: router,
+		policy: execPolicy,
 	}, nil
 }
 
