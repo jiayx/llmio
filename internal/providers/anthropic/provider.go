@@ -47,6 +47,10 @@ func (p *AnthropicNative) NativeProtocol() string {
 	return "anthropic"
 }
 
+func (p *AnthropicNative) NativeChatPath() string {
+	return "/messages"
+}
+
 // SupportsAnthropicAPI reports whether a native Anthropic API type should use passthrough.
 func (p *AnthropicNative) SupportsAnthropicAPI(apiType string) bool {
 	return providershared.SupportsAPIType(p.supported, apiType)

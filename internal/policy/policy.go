@@ -812,11 +812,22 @@ func modeForNormalizedDispatch(provider providerapi.ProviderAdapter, sourceProto
 }
 
 func logNormalizedDispatch(ctx context.Context, operation string, provider providerapi.ProviderAdapter, target routing.Target, externalModel string, req llm.ChatRequest) {
+	requestID := observability.RequestIDFromContext(ctx)
+	mode := modeForNormalizedDispatch(provider, req.SourceProtocol)
+	upstreamPath := normalizedUpstreamPath(provider)
+	slog.Info("request dispatch",
+		"request_id", requestID,
+		"path", observability.RequestPathFromContext(ctx),
+		"mode", mode,
+		"operation", operation,
+		"model", externalModel,
+		"provider", target.ProviderName,
+		"backend_model", target.BackendModel,
+		"upstream_path", upstreamPath,
+	)
 	if !observability.Enabled() {
 		return
 	}
-	requestID := observability.RequestIDFromContext(ctx)
-	mode := modeForNormalizedDispatch(provider, req.SourceProtocol)
 	body := req.RawRequestBody
 	if len(body) == 0 {
 		data, err := json.Marshal(req)
@@ -828,6 +839,7 @@ func logNormalizedDispatch(ctx context.Context, operation string, provider provi
 				"provider", target.ProviderName,
 				"external_model", externalModel,
 				"backend_model", target.BackendModel,
+				"upstream_path", upstreamPath,
 				"source_protocol", req.SourceProtocol,
 				"source_api_type", req.SourceAPIType,
 				"marshal_error", err,
@@ -843,6 +855,7 @@ func logNormalizedDispatch(ctx context.Context, operation string, provider provi
 		"provider", target.ProviderName,
 		"external_model", externalModel,
 		"backend_model", target.BackendModel,
+		"upstream_path", upstreamPath,
 		"source_protocol", req.SourceProtocol,
 		"source_api_type", req.SourceAPIType,
 		"request_body", observability.Bytes(body),
@@ -850,6 +863,15 @@ func logNormalizedDispatch(ctx context.Context, operation string, provider provi
 }
 
 func logPassthroughDispatch(ctx context.Context, meta protocols.RequestMeta, target routing.Target, payload []byte) {
+	slog.Info("request dispatch",
+		"request_id", observability.RequestIDFromContext(ctx),
+		"path", observability.RequestPathFromContext(ctx),
+		"mode", "passthrough",
+		"model", meta.ExternalModel,
+		"provider", target.ProviderName,
+		"backend_model", target.BackendModel,
+		"upstream_path", meta.UpstreamPath,
+	)
 	if !observability.Enabled() {
 		return
 	}
@@ -864,6 +886,14 @@ func logPassthroughDispatch(ctx context.Context, meta protocols.RequestMeta, tar
 		"upstream_path", meta.UpstreamPath,
 		"request_body", observability.Bytes(payload),
 	)
+}
+
+func normalizedUpstreamPath(provider providerapi.ProviderAdapter) string {
+	reporter, ok := provider.(providerapi.NativePathReporter)
+	if !ok {
+		return ""
+	}
+	return reporter.NativeChatPath()
 }
 
 func closeResponseBody(scope string, body interface{ Close() error }) {

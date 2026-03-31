@@ -22,6 +22,11 @@ type NativeProtocolReporter interface {
 	NativeProtocol() string
 }
 
+// NativePathReporter reports the provider's normalized upstream request path.
+type NativePathReporter interface {
+	NativeChatPath() string
+}
+
 // OpenAIPassthroughProvider forwards native OpenAI-compatible requests.
 type OpenAIPassthroughProvider interface {
 	ForwardOpenAI(ctx context.Context, upstreamPath string, body []byte, headers http.Header) (*http.Response, error)

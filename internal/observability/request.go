@@ -12,6 +12,7 @@ type contextKey string
 
 const (
 	requestIDKey    contextKey = "request_id"
+	requestPathKey  contextKey = "request_path"
 	RequestIDHeader            = "X-Request-Id"
 )
 
@@ -28,6 +29,21 @@ func RequestIDFromContext(ctx context.Context) string {
 	}
 	requestID, _ := ctx.Value(requestIDKey).(string)
 	return requestID
+}
+
+func WithRequestPath(ctx context.Context, path string) context.Context {
+	if strings.TrimSpace(path) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestPathKey, strings.TrimSpace(path))
+}
+
+func RequestPathFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	path, _ := ctx.Value(requestPathKey).(string)
+	return path
 }
 
 func RequestIDFromHeaders(headers http.Header) string {

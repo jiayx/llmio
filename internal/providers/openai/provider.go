@@ -50,6 +50,10 @@ func (p *OpenAICompatible) NativeProtocol() string {
 	return "openai"
 }
 
+func (p *OpenAICompatible) NativeChatPath() string {
+	return "/chat/completions"
+}
+
 // SupportsOpenAIAPI reports whether a native OpenAI API type should use passthrough.
 func (p *OpenAICompatible) SupportsOpenAIAPI(apiType string) bool {
 	return providershared.SupportsAPIType(p.supported, apiType)

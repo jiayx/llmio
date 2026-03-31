@@ -14,6 +14,7 @@ func Middleware(next http.Handler) http.Handler {
 		requestID := EnsureRequestID(r.Header)
 		w.Header().Set(RequestIDHeader, requestID)
 		r = r.WithContext(WithRequestID(r.Context(), requestID))
+		r = r.WithContext(WithRequestPath(r.Context(), r.URL.Path))
 
 		start := time.Now()
 		rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
