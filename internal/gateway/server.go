@@ -345,19 +345,14 @@ func (s *Server) handleAdminRuntimeConfig(w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 			return
 		}
-		cfg := &config.Config{
-			DatabasePath: "llmio.db",
-			Providers:    doc.Providers,
-			ModelRoutes:  doc.ModelRoutes,
-			Pricing:      doc.Pricing,
-		}
 		if len(doc.Providers) > 0 || len(doc.ModelRoutes) > 0 || len(doc.Pricing) > 0 {
-			if err := config.Prepare(cfg, "."); err != nil {
+			if err := config.PrepareRuntimeConfig(&doc); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
 		}
-		if _, _, _, err := s.buildRuntime(doc); err != nil {
+		snapshot, err := s.buildRuntimeSnapshot(doc)
+		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
@@ -365,10 +360,7 @@ func (s *Server) handleAdminRuntimeConfig(w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		if err := s.applyRuntimeConfig(doc); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
+		s.applyRuntimeSnapshot(snapshot)
 		writeJSON(w, http.StatusOK, doc)
 	default:
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
@@ -631,7 +623,11 @@ func allowsMethod(method string, allowed ...string) bool {
 }
 
 func (s *Server) executionPolicy() *policy.Policy {
-	return s.currentSnapshot().policy
+	snapshot := s.currentSnapshot()
+	if snapshot.policy != nil {
+		return snapshot.policy
+	}
+	return policy.New(policy.DefaultConfig(), nil)
 }
 
 func (s *Server) resolveRoute(externalModel string) (modelRoute, bool) {
@@ -651,25 +647,20 @@ func (s *Server) modelInfos() []routing.ModelInfo {
 }
 
 func (s *Server) applyRuntimeConfig(doc config.RuntimeConfig) error {
-	providersMap, router, execPolicy, err := s.buildRuntime(doc)
+	snapshot, err := s.buildRuntimeSnapshot(doc)
 	if err != nil {
 		return err
 	}
-
-	s.snapshot.Store(&runtimeSnapshot{
-		providers: providersMap,
-		router:    router,
-		policy:    execPolicy,
-	})
+	s.applyRuntimeSnapshot(snapshot)
 	return nil
 }
 
-func (s *Server) buildRuntime(doc config.RuntimeConfig) (map[string]chatProvider, *routing.Router, *policy.Policy, error) {
+func (s *Server) buildRuntimeSnapshot(doc config.RuntimeConfig) (*runtimeSnapshot, error) {
 	providersMap := make(map[string]chatProvider, len(doc.Providers))
 	for _, p := range doc.Providers {
 		adapter, err := providers.NewAdapter(p)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 		providersMap[p.Name] = adapter
 	}
@@ -685,7 +676,7 @@ func (s *Server) buildRuntime(doc config.RuntimeConfig) (map[string]chatProvider
 			Pricing:     doc.Pricing,
 		}, providersMap)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 	}
 
@@ -693,14 +684,25 @@ func (s *Server) buildRuntime(doc config.RuntimeConfig) (map[string]chatProvider
 		Catalog: billing.NewCatalog(doc.Pricing),
 		Next:    s.apiKeyStore,
 	})
-	return providersMap, router, execPolicy, nil
+	return &runtimeSnapshot{
+		providers: providersMap,
+		router:    router,
+		policy:    execPolicy,
+	}, nil
 }
 
 func (s *Server) currentSnapshot() *runtimeSnapshot {
 	if snapshot := s.snapshot.Load(); snapshot != nil {
 		return snapshot
 	}
-	panic("gateway runtime snapshot is not initialized")
+	return &runtimeSnapshot{}
+}
+
+func (s *Server) applyRuntimeSnapshot(snapshot *runtimeSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	s.snapshot.Store(snapshot)
 }
 
 func routeTargetsForLog(route modelRoute) []string {

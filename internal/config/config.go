@@ -87,6 +87,31 @@ func Prepare(cfg *Config, baseDir string) error {
 	if cfg == nil {
 		return fmt.Errorf("config is required")
 	}
+	if err := PrepareRuntimeConfig(&RuntimeConfig{
+		Providers:   cfg.Providers,
+		Pricing:     cfg.Pricing,
+		ModelRoutes: cfg.ModelRoutes,
+	}); err != nil {
+		return err
+	}
+
+	for i := range cfg.AdminAPIKeys {
+		cfg.AdminAPIKeys[i] = strings.TrimSpace(cfg.AdminAPIKeys[i])
+	}
+	cfg.DatabasePath = strings.TrimSpace(cfg.DatabasePath)
+	if cfg.DatabasePath == "" {
+		cfg.DatabasePath = filepath.Join(baseDir, "llmio.db")
+	} else if !filepath.IsAbs(cfg.DatabasePath) {
+		cfg.DatabasePath = filepath.Join(baseDir, cfg.DatabasePath)
+	}
+
+	return nil
+}
+
+func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("runtime config is required")
+	}
 	if len(cfg.Providers) == 0 {
 		return fmt.Errorf("config.providers is required")
 	}
@@ -125,16 +150,6 @@ func Prepare(cfg *Config, baseDir string) error {
 			apiTypes = append(apiTypes, apiType)
 		}
 		p.SupportedAPITypes = apiTypes
-	}
-
-	for i := range cfg.AdminAPIKeys {
-		cfg.AdminAPIKeys[i] = strings.TrimSpace(cfg.AdminAPIKeys[i])
-	}
-	cfg.DatabasePath = strings.TrimSpace(cfg.DatabasePath)
-	if cfg.DatabasePath == "" {
-		cfg.DatabasePath = filepath.Join(baseDir, "llmio.db")
-	} else if !filepath.IsAbs(cfg.DatabasePath) {
-		cfg.DatabasePath = filepath.Join(baseDir, cfg.DatabasePath)
 	}
 
 	for i := range cfg.ModelRoutes {
