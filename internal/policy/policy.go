@@ -47,14 +47,17 @@ type breakerState struct {
 	openUntil           time.Time
 }
 
+type runtimeProvider struct {
+	adapter providerapi.ProviderAdapter
+	mu      sync.Mutex
+	breaker breakerState
+}
+
 // Policy executes provider attempts with timeout, retry, and passive circuit breaking.
 type Policy struct {
 	cfg       Config
-	providers map[string]providerapi.ProviderAdapter
+	providers map[string]*runtimeProvider
 	recorder  usage.Recorder
-
-	mu       sync.Mutex
-	breakers map[string]*breakerState
 }
 
 // New constructs an execution policy.
@@ -82,9 +85,8 @@ func NewWithRecorder(cfg Config, adapters map[string]providerapi.ProviderAdapter
 
 	return &Policy{
 		cfg:       cfg,
-		providers: adapters,
+		providers: newRuntimeProviders(adapters),
 		recorder:  recorder,
-		breakers:  make(map[string]*breakerState, len(adapters)),
 	}
 }
 
@@ -93,23 +95,34 @@ func (p *Policy) ExecuteChat(ctx context.Context, route routing.Route, req llm.C
 	var lastErr error
 	for _, target := range route.Targets {
 		provider := p.providers[target.ProviderName]
-		if !p.allow(target.ProviderName) {
+		if provider == nil {
+			lastErr = fmt.Errorf("provider %s: not configured", target.ProviderName)
+			continue
+		}
+		if !provider.allow(target.ProviderName) {
 			lastErr = fmt.Errorf("provider %s: circuit open", target.ProviderName)
 			continue
 		}
 
-		providerReq := prepareChatRequestForTarget(req, target, provider)
-		logNormalizedDispatch(ctx, "chat", provider, target, req.Model, providerReq)
+		providerReq := prepareChatRequestForTarget(req, target, provider.adapter)
+		logNormalizedDispatch(ctx, "chat", provider.adapter, target, req.Model, providerReq)
 		attemptCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
-		resp, err := provider.Chat(attemptCtx, providerReq)
+		resp, err := provider.adapter.Chat(attemptCtx, providerReq)
 		cancel()
 		if err == nil {
-			p.markSuccess(target.ProviderName)
-			p.recordUsage(ctx, target, req.Model, "", "", false, false, true, resp.InputTokens, resp.OutputTokens)
+			provider.markSuccess()
+			p.recordUsage(ctx, target, req.Model, "", "", false, false, usageBreakdown{
+				inputTokens:              resp.InputTokens,
+				cachedInputTokens:        resp.CachedInputTokens,
+				cacheReadInputTokens:     resp.CacheReadInputTokens,
+				cacheCreationInputTokens: resp.CacheCreationInputTokens,
+				outputTokens:             resp.OutputTokens,
+				known:                    true,
+			})
 			return resp, nil
 		}
 
-		p.markFailure(target.ProviderName)
+		provider.markFailure(p.cfg.BreakerFailureThresh, p.cfg.BreakerOpenFor)
 		lastErr = fmt.Errorf("provider %s: %w", target.ProviderName, err)
 		if !IsRetryableError(err) {
 			return nil, lastErr
@@ -127,13 +140,17 @@ func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm
 	var lastErr error
 	for _, target := range route.Targets {
 		provider := p.providers[target.ProviderName]
-		if !p.allow(target.ProviderName) {
+		if provider == nil {
+			lastErr = fmt.Errorf("provider %s: not configured", target.ProviderName)
+			continue
+		}
+		if !provider.allow(target.ProviderName) {
 			lastErr = fmt.Errorf("provider %s: circuit open", target.ProviderName)
 			continue
 		}
 
-		providerReq := prepareChatRequestForTarget(req, target, provider)
-		logNormalizedDispatch(ctx, "stream", provider, target, req.Model, providerReq)
+		providerReq := prepareChatRequestForTarget(req, target, provider.adapter)
+		logNormalizedDispatch(ctx, "stream", provider.adapter, target, req.Model, providerReq)
 		attemptCtx, cancel := context.WithCancel(ctx)
 		type streamResult struct {
 			stream *providerapi.StreamReader
@@ -141,7 +158,7 @@ func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm
 		}
 		resultCh := make(chan streamResult, 1)
 		go func() {
-			stream, err := provider.ChatStream(attemptCtx, providerReq)
+			stream, err := provider.adapter.ChatStream(attemptCtx, providerReq)
 			resultCh <- streamResult{stream: stream, err: err}
 		}()
 
@@ -161,12 +178,12 @@ func (p *Policy) ExecuteStream(ctx context.Context, route routing.Route, req llm
 			err = result.err
 		}
 		if err == nil {
-			p.markSuccess(target.ProviderName)
+			provider.markSuccess()
 			return p.wrapStreamUsage(ctx, target, req.Model, wrapStreamClose(stream, cancel)), nil
 		}
 		cancel()
 
-		p.markFailure(target.ProviderName)
+		provider.markFailure(p.cfg.BreakerFailureThresh, p.cfg.BreakerOpenFor)
 		lastErr = fmt.Errorf("provider %s: %w", target.ProviderName, err)
 		if !IsRetryableError(err) {
 			return nil, lastErr
@@ -201,16 +218,19 @@ func wrapStreamClose(stream *providerapi.StreamReader, onClose func()) *provider
 func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, meta protocols.RequestMeta) (*http.Response, bool, error) {
 	for _, target := range route.Targets {
 		provider := p.providers[target.ProviderName]
+		if provider == nil {
+			continue
+		}
 
-		supporter, ok := provider.(providerapi.PassthroughSupporter)
+		supporter, ok := provider.adapter.(providerapi.PassthroughSupporter)
 		if !ok || !supporter.SupportsPassthrough(meta.Protocol, meta.APIType) {
 			continue
 		}
-		forwarder, ok := provider.(providerapi.PassthroughForwarder)
+		forwarder, ok := provider.adapter.(providerapi.PassthroughForwarder)
 		if !ok {
 			continue
 		}
-		if !p.allow(target.ProviderName) {
+		if !provider.allow(target.ProviderName) {
 			continue
 		}
 
@@ -224,7 +244,7 @@ func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, me
 		resp, err := forwarder.Forward(attemptCtx, meta.Protocol, meta.UpstreamPath, payload, meta.Headers)
 		if err != nil {
 			cancel()
-			p.markFailure(target.ProviderName)
+			provider.markFailure(p.cfg.BreakerFailureThresh, p.cfg.BreakerOpenFor)
 			if IsRetryableError(err) {
 				continue
 			}
@@ -232,19 +252,19 @@ func (p *Policy) ExecutePassthrough(ctx context.Context, route routing.Route, me
 		}
 		if IsUnsupportedPassthroughStatus(resp.StatusCode) {
 			cancel()
-			p.markFailure(target.ProviderName)
+			provider.markFailure(p.cfg.BreakerFailureThresh, p.cfg.BreakerOpenFor)
 			closeResponseBody("passthrough unsupported", resp.Body)
 			continue
 		}
 		if IsRetryableStatus(resp.StatusCode) {
 			cancel()
-			p.markFailure(target.ProviderName)
+			provider.markFailure(p.cfg.BreakerFailureThresh, p.cfg.BreakerOpenFor)
 			closeResponseBody("passthrough retry", resp.Body)
 			continue
 		}
 
 		resp.Body = newCancelOnCloseBody(resp.Body, cancel)
-		p.markSuccess(target.ProviderName)
+		provider.markSuccess()
 		p.attachPassthroughUsage(ctx, target, meta, resp)
 		return resp, true, nil
 	}
@@ -260,11 +280,9 @@ func (p *Policy) wrapStreamUsage(ctx context.Context, target routing.Target, ext
 		defer close(events)
 
 		var (
-			srcEvents  = stream.Events
-			srcErrs    = stream.Err
-			input      int
-			output     int
-			usageKnown bool
+			srcEvents = stream.Events
+			srcErrs   = stream.Err
+			usage     usageBreakdown
 		)
 
 		for srcEvents != nil || srcErrs != nil {
@@ -275,15 +293,21 @@ func (p *Policy) wrapStreamUsage(ctx context.Context, target routing.Target, ext
 					continue
 				}
 				if event.Type == llm.StreamEventUsage {
-					input = event.InputTokens
-					output = event.OutputTokens
-					usageKnown = true
+					usage.inputTokens = event.InputTokens
+					usage.cachedInputTokens = event.CachedInputTokens
+					usage.cacheReadInputTokens = event.CacheReadInputTokens
+					usage.cacheCreationInputTokens = event.CacheCreationInputTokens
+					usage.outputTokens = event.OutputTokens
+					usage.known = true
 					if observability.Enabled() {
 						slog.Debug("usage stream event trace",
 							"provider", target.ProviderName,
 							"external_model", externalModel,
-							"input_tokens", input,
-							"output_tokens", output,
+							"input_tokens", usage.inputTokens,
+							"cached_input_tokens", usage.cachedInputTokens,
+							"cache_read_input_tokens", usage.cacheReadInputTokens,
+							"cache_creation_input_tokens", usage.cacheCreationInputTokens,
+							"output_tokens", usage.outputTokens,
 						)
 					}
 				}
@@ -300,7 +324,7 @@ func (p *Policy) wrapStreamUsage(ctx context.Context, target routing.Target, ext
 			}
 		}
 
-		p.recordUsage(ctx, target, externalModel, "", "", true, false, usageKnown, input, output)
+		p.recordUsage(ctx, target, externalModel, "", "", true, false, usage)
 	}()
 
 	return &providerapi.StreamReader{
@@ -331,55 +355,79 @@ func (p *Policy) attachPassthroughUsage(ctx context.Context, target routing.Targ
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(data))
 
-	input, output, known := extractPassthroughUsage(meta, data)
+	usage := extractPassthroughUsage(meta, data)
 	if observability.Enabled() {
 		slog.Debug("usage passthrough body trace",
 			"provider", target.ProviderName,
 			"protocol", meta.Protocol,
 			"api_type", meta.APIType,
 			"body", observability.Bytes(data),
-			"input_tokens", input,
-			"output_tokens", output,
-			"usage_known", known,
+			"input_tokens", usage.inputTokens,
+			"cached_input_tokens", usage.cachedInputTokens,
+			"cache_read_input_tokens", usage.cacheReadInputTokens,
+			"cache_creation_input_tokens", usage.cacheCreationInputTokens,
+			"output_tokens", usage.outputTokens,
+			"usage_known", usage.known,
 		)
 	}
-	p.recordUsage(ctx, target, meta.ExternalModel, meta.Protocol, meta.APIType, meta.Stream, true, known, input, output)
+	p.recordUsage(ctx, target, meta.ExternalModel, meta.Protocol, meta.APIType, meta.Stream, true, usage)
 }
 
-func extractPassthroughUsage(meta protocols.RequestMeta, data []byte) (int, int, bool) {
+func extractPassthroughUsage(meta protocols.RequestMeta, data []byte) usageBreakdown {
 	switch meta.Protocol {
 	case protocols.ProtocolOpenAI:
 		switch meta.APIType {
 		case protocols.APIChatCompletions:
 			var resp protocolopenai.ChatCompletionResponse
 			if err := json.Unmarshal(data, &resp); err != nil || resp.Usage == nil {
-				return 0, 0, false
+				return usageBreakdown{}
 			}
 			out := protocolopenai.ChatCompletionResponseToLLM(resp, data)
-			return out.InputTokens, out.OutputTokens, true
+			return usageBreakdown{
+				inputTokens:              out.InputTokens,
+				cachedInputTokens:        out.CachedInputTokens,
+				cacheReadInputTokens:     out.CacheReadInputTokens,
+				cacheCreationInputTokens: out.CacheCreationInputTokens,
+				outputTokens:             out.OutputTokens,
+				known:                    true,
+			}
 		case protocols.APIResponses:
 			var resp protocolopenai.ResponsesResponse
 			if err := json.Unmarshal(data, &resp); err != nil || resp.Usage == nil {
-				return 0, 0, false
+				return usageBreakdown{}
 			}
 			out := protocolopenai.ResponsesResponseToLLM(resp, data)
-			return out.InputTokens, out.OutputTokens, true
+			return usageBreakdown{
+				inputTokens:              out.InputTokens,
+				cachedInputTokens:        out.CachedInputTokens,
+				cacheReadInputTokens:     out.CacheReadInputTokens,
+				cacheCreationInputTokens: out.CacheCreationInputTokens,
+				outputTokens:             out.OutputTokens,
+				known:                    true,
+			}
 		}
 	case protocols.ProtocolAnthropic:
 		if meta.APIType != protocols.APIMessages {
-			return 0, 0, false
+			return usageBreakdown{}
 		}
 		var resp protocolanthropic.MessagesResponse
 		if err := json.Unmarshal(data, &resp); err != nil {
-			return 0, 0, false
+			return usageBreakdown{}
 		}
 		out := protocolanthropic.MessagesResponseToLLM(resp, data)
-		return out.InputTokens, out.OutputTokens, true
+		return usageBreakdown{
+			inputTokens:              out.InputTokens,
+			cachedInputTokens:        out.CachedInputTokens,
+			cacheReadInputTokens:     out.CacheReadInputTokens,
+			cacheCreationInputTokens: out.CacheCreationInputTokens,
+			outputTokens:             out.OutputTokens,
+			known:                    true,
+		}
 	}
-	return 0, 0, false
+	return usageBreakdown{}
 }
 
-func (p *Policy) recordUsage(ctx context.Context, target routing.Target, externalModel, protocol, apiType string, stream, passthrough, usageKnown bool, inputTokens, outputTokens int) {
+func (p *Policy) recordUsage(ctx context.Context, target routing.Target, externalModel, protocol, apiType string, stream, passthrough bool, breakdown usageBreakdown) {
 	var (
 		apiKeyID   string
 		apiKeyName string
@@ -389,20 +437,23 @@ func (p *Policy) recordUsage(ctx context.Context, target routing.Target, externa
 		apiKeyName = principal.Name
 	}
 	p.recordUsageEvent(ctx, usage.Event{
-		Timestamp:     time.Now().UTC(),
-		APIKeyID:      apiKeyID,
-		APIKeyName:    apiKeyName,
-		ProviderName:  target.ProviderName,
-		ExternalModel: externalModel,
-		BackendModel:  target.BackendModel,
-		Protocol:      protocol,
-		APIType:       apiType,
-		InputTokens:   inputTokens,
-		OutputTokens:  outputTokens,
-		TotalTokens:   inputTokens + outputTokens,
-		Stream:        stream,
-		Passthrough:   passthrough,
-		UsageKnown:    usageKnown,
+		Timestamp:                time.Now().UTC(),
+		APIKeyID:                 apiKeyID,
+		APIKeyName:               apiKeyName,
+		ProviderName:             target.ProviderName,
+		ExternalModel:            externalModel,
+		BackendModel:             target.BackendModel,
+		Protocol:                 protocol,
+		APIType:                  apiType,
+		InputTokens:              breakdown.inputTokens,
+		CachedInputTokens:        breakdown.cachedInputTokens,
+		CacheReadInputTokens:     breakdown.cacheReadInputTokens,
+		CacheCreationInputTokens: breakdown.cacheCreationInputTokens,
+		OutputTokens:             breakdown.outputTokens,
+		TotalTokens:              breakdown.inputTokens + breakdown.outputTokens,
+		Stream:                   stream,
+		Passthrough:              passthrough,
+		UsageKnown:               breakdown.known,
 	})
 }
 
@@ -420,6 +471,9 @@ func (p *Policy) recordUsageEvent(ctx context.Context, event usage.Event) {
 			"passthrough", event.Passthrough,
 			"usage_known", event.UsageKnown,
 			"input_tokens", event.InputTokens,
+			"cached_input_tokens", event.CachedInputTokens,
+			"cache_read_input_tokens", event.CacheReadInputTokens,
+			"cache_creation_input_tokens", event.CacheCreationInputTokens,
 			"output_tokens", event.OutputTokens,
 		)
 	}
@@ -431,18 +485,30 @@ func (p *Policy) recordUsageEvent(ctx context.Context, event usage.Event) {
 }
 
 type passthroughUsageBody struct {
-	body         io.ReadCloser
-	record       func(usage.Event)
-	target       routing.Target
-	meta         protocols.RequestMeta
-	lineBuf      []byte
-	eventName    string
-	blockState   map[int]protocolanthropic.ContentBlock
-	inputTokens  int
-	outputTokens int
-	usageKnown   bool
-	recorded     bool
-	failed       bool
+	body                     io.ReadCloser
+	record                   func(usage.Event)
+	target                   routing.Target
+	meta                     protocols.RequestMeta
+	lineBuf                  []byte
+	eventName                string
+	blockState               map[int]protocolanthropic.ContentBlock
+	inputTokens              int
+	cachedInputTokens        int
+	cacheReadInputTokens     int
+	cacheCreationInputTokens int
+	outputTokens             int
+	usageKnown               bool
+	recorded                 bool
+	failed                   bool
+}
+
+type usageBreakdown struct {
+	inputTokens              int
+	cachedInputTokens        int
+	cacheReadInputTokens     int
+	cacheCreationInputTokens int
+	outputTokens             int
+	known                    bool
 }
 
 type cancelOnCloseBody struct {
@@ -561,6 +627,9 @@ func (b *passthroughUsageBody) consumeLine(line string) {
 					slog.Debug("usage passthrough responses stream trace",
 						"payload", observability.String(payload),
 						"input_tokens", event.InputTokens,
+						"cached_input_tokens", event.CachedInputTokens,
+						"cache_read_input_tokens", event.CacheReadInputTokens,
+						"cache_creation_input_tokens", event.CacheCreationInputTokens,
 						"output_tokens", event.OutputTokens,
 					)
 				}
@@ -587,9 +656,12 @@ func openAIResponsesUsageEvent(payload string) (llm.StreamEvent, bool) {
 	}
 	out := protocolopenai.ResponsesResponseToLLM(resp, []byte(payload))
 	return llm.StreamEvent{
-		Type:         llm.StreamEventUsage,
-		InputTokens:  out.InputTokens,
-		OutputTokens: out.OutputTokens,
+		Type:                     llm.StreamEventUsage,
+		InputTokens:              out.InputTokens,
+		CachedInputTokens:        out.CachedInputTokens,
+		CacheReadInputTokens:     out.CacheReadInputTokens,
+		CacheCreationInputTokens: out.CacheCreationInputTokens,
+		OutputTokens:             out.OutputTokens,
 	}, true
 }
 
@@ -599,6 +671,9 @@ func (b *passthroughUsageBody) observeEvents(events []llm.StreamEvent) {
 			continue
 		}
 		b.inputTokens = event.InputTokens
+		b.cachedInputTokens = event.CachedInputTokens
+		b.cacheReadInputTokens = event.CacheReadInputTokens
+		b.cacheCreationInputTokens = event.CacheCreationInputTokens
 		b.outputTokens = event.OutputTokens
 		b.usageKnown = true
 	}
@@ -610,20 +685,23 @@ func (b *passthroughUsageBody) finish() {
 	}
 	b.recorded = true
 	b.record(usage.Event{
-		Timestamp:     time.Now().UTC(),
-		APIKeyID:      b.meta.APIKeyID,
-		APIKeyName:    b.meta.APIKeyName,
-		ProviderName:  b.target.ProviderName,
-		ExternalModel: b.meta.ExternalModel,
-		BackendModel:  b.target.BackendModel,
-		Protocol:      b.meta.Protocol,
-		APIType:       b.meta.APIType,
-		InputTokens:   b.inputTokens,
-		OutputTokens:  b.outputTokens,
-		TotalTokens:   b.inputTokens + b.outputTokens,
-		Stream:        true,
-		Passthrough:   true,
-		UsageKnown:    b.usageKnown,
+		Timestamp:                time.Now().UTC(),
+		APIKeyID:                 b.meta.APIKeyID,
+		APIKeyName:               b.meta.APIKeyName,
+		ProviderName:             b.target.ProviderName,
+		ExternalModel:            b.meta.ExternalModel,
+		BackendModel:             b.target.BackendModel,
+		Protocol:                 b.meta.Protocol,
+		APIType:                  b.meta.APIType,
+		InputTokens:              b.inputTokens,
+		CachedInputTokens:        b.cachedInputTokens,
+		CacheReadInputTokens:     b.cacheReadInputTokens,
+		CacheCreationInputTokens: b.cacheCreationInputTokens,
+		OutputTokens:             b.outputTokens,
+		TotalTokens:              b.inputTokens + b.outputTokens,
+		Stream:                   true,
+		Passthrough:              true,
+		UsageKnown:               b.usageKnown,
 	})
 }
 
@@ -668,50 +746,46 @@ func (p *Policy) timeoutFor(stream bool) time.Duration {
 	return p.cfg.RequestTimeout
 }
 
-func (p *Policy) allow(provider string) bool {
+func newRuntimeProviders(adapters map[string]providerapi.ProviderAdapter) map[string]*runtimeProvider {
+	providers := make(map[string]*runtimeProvider, len(adapters))
+	for name, adapter := range adapters {
+		providers[name] = &runtimeProvider{adapter: adapter}
+	}
+	return providers
+}
+
+func (p *runtimeProvider) allow(providerName string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	state := p.breaker(provider)
-	if state.openUntil.IsZero() || time.Now().After(state.openUntil) {
-		state.openUntil = time.Time{}
+	if p.breaker.openUntil.IsZero() || time.Now().After(p.breaker.openUntil) {
+		p.breaker.openUntil = time.Time{}
 		return true
 	}
 
-	slog.Warn("provider circuit open", "provider", provider, "open_until", state.openUntil)
+	slog.Warn("provider circuit open", "provider", providerName, "open_until", p.breaker.openUntil)
 	return false
 }
 
-func (p *Policy) markSuccess(provider string) {
+func (p *runtimeProvider) markSuccess() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	state := p.breaker(provider)
-	state.consecutiveFailures = 0
-	state.openUntil = time.Time{}
+	p.breaker.consecutiveFailures = 0
+	p.breaker.openUntil = time.Time{}
 }
 
-func (p *Policy) markFailure(provider string) {
+func (p *runtimeProvider) markFailure(threshold int, openFor time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	state := p.breaker(provider)
-	state.consecutiveFailures++
-	if state.consecutiveFailures < p.cfg.BreakerFailureThresh {
+	p.breaker.consecutiveFailures++
+	if p.breaker.consecutiveFailures < threshold {
 		return
 	}
 
-	state.openUntil = time.Now().Add(p.cfg.BreakerOpenFor)
-	state.consecutiveFailures = 0
-}
-
-func (p *Policy) breaker(provider string) *breakerState {
-	state := p.breakers[provider]
-	if state == nil {
-		state = &breakerState{}
-		p.breakers[provider] = state
-	}
-	return state
+	p.breaker.openUntil = time.Now().Add(openFor)
+	p.breaker.consecutiveFailures = 0
 }
 
 func sanitizeChatRequest(req llm.ChatRequest, target routing.Target) llm.ChatRequest {

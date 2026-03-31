@@ -77,6 +77,8 @@ func ChatCompletionResponseToLLM(resp ChatCompletionResponse, raw []byte) *llm.C
 	}
 	if resp.Usage != nil {
 		out.InputTokens = resp.Usage.PromptTokens
+		out.CachedInputTokens = cachedPromptTokens(resp.Usage)
+		out.CacheReadInputTokens = cachedPromptTokens(resp.Usage)
 		out.OutputTokens = resp.Usage.CompletionTokens
 	}
 	if len(resp.Choices) > 0 {
@@ -97,6 +99,8 @@ func ResponsesResponseToLLM(resp ResponsesResponse, raw []byte) *llm.ChatRespons
 	}
 	if resp.Usage != nil {
 		out.InputTokens = resp.Usage.InputTokens
+		out.CachedInputTokens = cachedResponseInputTokens(resp.Usage)
+		out.CacheReadInputTokens = cachedResponseInputTokens(resp.Usage)
 		out.OutputTokens = resp.Usage.OutputTokens
 	}
 	out.Output = responsesOutputToLLM(resp.Output)
@@ -159,22 +163,40 @@ func StreamChunkPayloadToLLMEvents(payload string) ([]llm.StreamEvent, error) {
 		}
 		if choice.Usage != nil {
 			events = append(events, llm.StreamEvent{
-				Type:         llm.StreamEventUsage,
-				InputTokens:  choice.Usage.PromptTokens,
-				OutputTokens: choice.Usage.CompletionTokens,
-				Raw:          raw,
+				Type:                 llm.StreamEventUsage,
+				InputTokens:          choice.Usage.PromptTokens,
+				CachedInputTokens:    cachedPromptTokens(choice.Usage),
+				CacheReadInputTokens: cachedPromptTokens(choice.Usage),
+				OutputTokens:         choice.Usage.CompletionTokens,
+				Raw:                  raw,
 			})
 		}
 	}
 	if chunk.Usage != nil {
 		events = append(events, llm.StreamEvent{
-			Type:         llm.StreamEventUsage,
-			InputTokens:  chunk.Usage.PromptTokens,
-			OutputTokens: chunk.Usage.CompletionTokens,
-			Raw:          raw,
+			Type:                 llm.StreamEventUsage,
+			InputTokens:          chunk.Usage.PromptTokens,
+			CachedInputTokens:    cachedPromptTokens(chunk.Usage),
+			CacheReadInputTokens: cachedPromptTokens(chunk.Usage),
+			OutputTokens:         chunk.Usage.CompletionTokens,
+			Raw:                  raw,
 		})
 	}
 	return events, nil
+}
+
+func cachedPromptTokens(usage *CompletionUsage) int {
+	if usage == nil || usage.PromptTokensDetails == nil {
+		return 0
+	}
+	return usage.PromptTokensDetails.CachedTokens
+}
+
+func cachedResponseInputTokens(usage *ResponseUsage) int {
+	if usage == nil || usage.InputTokensDetails == nil {
+		return 0
+	}
+	return usage.InputTokensDetails.CachedTokens
 }
 
 func chatCompletionMessageToLLM(msg Message) []llm.ContentPart {

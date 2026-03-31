@@ -42,6 +42,51 @@ func TestStreamChunkPayloadToLLMEventsSupportsReasoningContentAndChoiceUsage(t *
 	}
 }
 
+func TestResponsesResponseToLLMIncludesCachedInputTokens(t *testing.T) {
+	resp := ResponsesResponse{
+		ID:     "resp_1",
+		Model:  "gpt-5.4",
+		Status: "completed",
+		Usage: &ResponseUsage{
+			InputTokens:  120,
+			OutputTokens: 30,
+			TotalTokens:  150,
+			InputTokensDetails: &InputTokenDetails{
+				CachedTokens: 80,
+			},
+		},
+	}
+
+	got := ResponsesResponseToLLM(resp, []byte(`{}`))
+	if got.InputTokens != 120 || got.CachedInputTokens != 80 || got.CacheReadInputTokens != 80 || got.OutputTokens != 30 {
+		t.Fatalf("response = %#v", got)
+	}
+}
+
+func TestStreamChunkPayloadToLLMEventsIncludesCachedPromptTokens(t *testing.T) {
+	events, err := StreamChunkPayloadToLLMEvents(`{
+		"id":"chatcmpl-1",
+		"object":"chat.completion.chunk",
+		"model":"gpt-5.4",
+		"choices":[],
+		"usage":{
+			"prompt_tokens":120,
+			"completion_tokens":30,
+			"total_tokens":150,
+			"prompt_tokens_details":{"cached_tokens":80}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("StreamChunkPayloadToLLMEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %#v", events)
+	}
+	if events[0].CachedInputTokens != 80 || events[0].CacheReadInputTokens != 80 {
+		t.Fatalf("event = %#v", events[0])
+	}
+}
+
 func TestWriteErrorUsesOfficialEnvelope(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WriteError(rec, 400, "bad request")

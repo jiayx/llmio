@@ -26,30 +26,36 @@ type Message struct {
 
 // ChatResponse is the normalized non-streaming provider response.
 type ChatResponse struct {
-	ID           string
-	Model        string
-	Output       []ContentPart
-	OutputText   string
-	FinishReason string
-	InputTokens  int
-	OutputTokens int
-	Raw          []byte
+	ID                       string
+	Model                    string
+	Output                   []ContentPart
+	OutputText               string
+	FinishReason             string
+	InputTokens              int
+	CachedInputTokens        int
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
+	OutputTokens             int
+	Raw                      []byte
 }
 
 // StreamEvent is a normalized streaming event emitted by providers.
 type StreamEvent struct {
-	Type         string
-	BlockIndex   int
-	Part         ContentPart
-	TextDelta    string
-	ToolIndex    int
-	ToolCallID   string
-	ToolName     string
-	ToolInput    string
-	FinishReason string
-	InputTokens  int
-	OutputTokens int
-	Raw          []byte
+	Type                     string
+	BlockIndex               int
+	Part                     ContentPart
+	TextDelta                string
+	ToolIndex                int
+	ToolCallID               string
+	ToolName                 string
+	ToolInput                string
+	FinishReason             string
+	InputTokens              int
+	CachedInputTokens        int
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
+	OutputTokens             int
+	Raw                      []byte
 }
 
 // ContentPart is a typed segment of message or response content.

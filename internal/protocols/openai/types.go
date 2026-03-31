@@ -73,9 +73,14 @@ type StreamDelta struct {
 }
 
 type CompletionUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                 `json:"prompt_tokens"`
+	PromptTokensDetails *PromptTokenDetails `json:"prompt_tokens_details,omitempty"`
+	CompletionTokens    int                 `json:"completion_tokens"`
+	TotalTokens         int                 `json:"total_tokens"`
+}
+
+type PromptTokenDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
 }
 
 type CompletionError struct {
@@ -140,9 +145,19 @@ type ResponseContentPart struct {
 }
 
 type ResponseUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int                 `json:"input_tokens"`
+	InputTokensDetails  *InputTokenDetails  `json:"input_tokens_details,omitempty"`
+	OutputTokens        int                 `json:"output_tokens"`
+	OutputTokensDetails *OutputTokenDetails `json:"output_tokens_details,omitempty"`
+	TotalTokens         int                 `json:"total_tokens"`
+}
+
+type InputTokenDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+type OutputTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 type Tool struct {

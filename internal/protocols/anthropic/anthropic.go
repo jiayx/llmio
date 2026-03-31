@@ -49,8 +49,10 @@ func WriteMessagesResponse(w http.ResponseWriter, externalModel string, resp *ll
 		Role:  "assistant",
 		Model: externalModel,
 		Usage: Usage{
-			InputTokens:  resp.InputTokens,
-			OutputTokens: resp.OutputTokens,
+			InputTokens:              resp.InputTokens,
+			CacheReadInputTokens:     resp.CacheReadInputTokens,
+			CacheCreationInputTokens: resp.CacheCreationInputTokens,
+			OutputTokens:             resp.OutputTokens,
 		},
 	}
 	out.Content = llmContentToAnthropic(parts)
@@ -93,6 +95,8 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 	flusher.Flush()
 
 	outputTokens := 0
+	cacheReadInputTokens := 0
+	cacheCreationInputTokens := 0
 	openBlocks := make(map[int]llm.ContentPart)
 	nextBlockIndex := 0
 	startBlock := func(index int, part llm.ContentPart) {
@@ -135,7 +139,9 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 						StopReason: "end_turn",
 					},
 					Usage: StreamUsage{
-						OutputTokens: outputTokens,
+						OutputTokens:             outputTokens,
+						CacheReadInputTokens:     cacheReadInputTokens,
+						CacheCreationInputTokens: cacheCreationInputTokens,
 					},
 				})
 				httpio.WriteSSEJSON(w, "message_stop", map[string]string{"type": "message_stop"})
@@ -185,6 +191,8 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 				flusher.Flush()
 			case llm.StreamEventUsage:
 				outputTokens = event.OutputTokens
+				cacheReadInputTokens = event.CacheReadInputTokens
+				cacheCreationInputTokens = event.CacheCreationInputTokens
 			case llm.StreamEventStop:
 				for index := range openBlocks {
 					stopBlock(index)
@@ -195,7 +203,9 @@ func ServeMessagesStream(w http.ResponseWriter, r *http.Request, externalModel s
 						StopReason: mapFinishReason(event.FinishReason),
 					},
 					Usage: StreamUsage{
-						OutputTokens: outputTokens,
+						OutputTokens:             outputTokens,
+						CacheReadInputTokens:     cacheReadInputTokens,
+						CacheCreationInputTokens: cacheCreationInputTokens,
 					},
 				})
 				httpio.WriteSSEJSON(w, "message_stop", map[string]string{"type": "message_stop"})

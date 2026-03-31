@@ -10,8 +10,10 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 
 	"github.com/jiayx/llmio/internal/apikeys"
+	"github.com/jiayx/llmio/internal/billing"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
 	"github.com/jiayx/llmio/internal/observability"
@@ -22,19 +24,25 @@ import (
 	"github.com/jiayx/llmio/internal/providers"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
+	"github.com/jiayx/llmio/internal/runtimeconfig"
 )
 
 type chatProvider = providerapi.ProviderAdapter
 type routeTarget = routing.Target
 type modelRoute = routing.Route
 
+type runtimeSnapshot struct {
+	providers map[string]chatProvider
+	router    *routing.Router
+	policy    *policy.Policy
+}
+
 // Server routes compatible OpenAI and Anthropic requests to configured providers.
 type Server struct {
 	adminAPIKeys     map[string]apikeys.Principal
 	apiKeyStore      *apikeys.Store
-	providers        map[string]chatProvider
-	router           *routing.Router
-	policy           *policy.Policy
+	runtimeStore     *runtimeconfig.Store
+	snapshot         atomic.Pointer[runtimeSnapshot]
 	protocolAdapters []protocols.ProtocolAdapter
 }
 
@@ -42,7 +50,6 @@ type Server struct {
 func NewServer(cfg *config.Config) (*Server, error) {
 	s := &Server{
 		adminAPIKeys:     make(map[string]apikeys.Principal, len(cfg.AdminAPIKeys)),
-		providers:        make(map[string]chatProvider, len(cfg.Providers)),
 		protocolAdapters: protocols.DefaultAdapters(),
 	}
 
@@ -61,20 +68,18 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	}
 	s.apiKeyStore = store
 
-	for _, p := range cfg.Providers {
-		adapter, err := providers.NewAdapter(p)
-		if err != nil {
-			return nil, err
-		}
-		s.providers[p.Name] = adapter
-	}
-
-	router, err := routing.New(cfg, s.providers)
+	runtimeStore, err := runtimeconfig.Open(cfg.DatabasePath)
 	if err != nil {
 		return nil, err
 	}
-	s.router = router
-	s.policy = policy.NewWithRecorder(policy.DefaultConfig(), s.providers, store)
+	s.runtimeStore = runtimeStore
+	if err := s.applyRuntimeConfig(config.RuntimeConfig{
+		Providers:   cfg.Providers,
+		ModelRoutes: cfg.ModelRoutes,
+		Pricing:     cfg.Pricing,
+	}); err != nil {
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -86,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/usage", s.handleAdminUsage)
 	mux.HandleFunc("/admin/api-keys", s.handleAdminAPIKeys)
 	mux.HandleFunc("/admin/api-keys/", s.handleAdminAPIKeyByID)
+	mux.HandleFunc("/admin/runtime-config", s.handleAdminRuntimeConfig)
 	s.registerProtocolRoutes(mux)
 	return observability.Middleware(s.withRecovery(s.withAuth(mux)))
 }
@@ -120,6 +126,10 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			writeUnauthorized(w, r.URL.Path)
 			return
 		}
+		if principal.Managed && s.apiKeyStore != nil && s.apiKeyStore.BudgetExceeded(principal.ID) {
+			writeBudgetExceeded(w, r.URL.Path)
+			return
+		}
 
 		next.ServeHTTP(w, r.WithContext(apikeys.WithPrincipal(r.Context(), principal)))
 	})
@@ -145,6 +155,18 @@ func writeUnauthorized(w http.ResponseWriter, path string) {
 		return
 	}
 	writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+}
+
+func writeBudgetExceeded(w http.ResponseWriter, path string) {
+	if adapter, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok && adapter.Protocol() == protocols.ProtocolAnthropic {
+		protocolanthropic.WriteError(w, http.StatusPaymentRequired, "permission_error", "budget exceeded")
+		return
+	}
+	if _, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok {
+		protocolopenai.WriteError(w, http.StatusPaymentRequired, "budget exceeded")
+		return
+	}
+	writeJSON(w, http.StatusPaymentRequired, map[string]any{"error": "budget exceeded"})
 }
 
 func writePanicError(w http.ResponseWriter, path string) {
@@ -205,13 +227,14 @@ func (s *Server) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request) {
 		})
 	case http.MethodPost:
 		var req struct {
-			Name string `json:"name"`
+			Name      string   `json:"name"`
+			BudgetUSD *float64 `json:"budget_usd,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 			return
 		}
-		created, err := s.apiKeyStore.Create(req.Name)
+		created, err := s.apiKeyStore.Create(req.Name, req.BudgetUSD)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
@@ -293,6 +316,64 @@ func (s *Server) handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 		"total": total,
 		"data":  data,
 	})
+}
+
+func (s *Server) handleAdminRuntimeConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if s.runtimeStore == nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "runtime config store unavailable"})
+			return
+		}
+		doc, _, err := s.runtimeStore.Load()
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeJSON(w, http.StatusOK, config.RuntimeConfig{})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, doc)
+	case http.MethodPut:
+		if s.runtimeStore == nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "runtime config store unavailable"})
+			return
+		}
+		var doc config.RuntimeConfig
+		if err := json.NewDecoder(r.Body).Decode(&doc); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		cfg := &config.Config{
+			DatabasePath: "llmio.db",
+			Providers:    doc.Providers,
+			ModelRoutes:  doc.ModelRoutes,
+			Pricing:      doc.Pricing,
+		}
+		if len(doc.Providers) > 0 || len(doc.ModelRoutes) > 0 || len(doc.Pricing) > 0 {
+			if err := config.Prepare(cfg, "."); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+		}
+		if _, _, _, err := s.buildRuntime(doc); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.runtimeStore.Save(doc); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := s.applyRuntimeConfig(doc); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, doc)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -550,24 +631,76 @@ func allowsMethod(method string, allowed ...string) bool {
 }
 
 func (s *Server) executionPolicy() *policy.Policy {
-	if s.policy == nil {
-		s.policy = policy.New(policy.DefaultConfig(), s.providers)
-	}
-	return s.policy
+	return s.currentSnapshot().policy
 }
 
 func (s *Server) resolveRoute(externalModel string) (modelRoute, bool) {
-	if s.router == nil {
+	snapshot := s.currentSnapshot()
+	if snapshot.router == nil {
 		return modelRoute{}, false
 	}
-	return s.router.Resolve(externalModel)
+	return snapshot.router.Resolve(externalModel)
 }
 
 func (s *Server) modelInfos() []routing.ModelInfo {
-	if s.router == nil {
+	snapshot := s.currentSnapshot()
+	if snapshot.router == nil {
 		return nil
 	}
-	return s.router.ModelInfos()
+	return snapshot.router.ModelInfos()
+}
+
+func (s *Server) applyRuntimeConfig(doc config.RuntimeConfig) error {
+	providersMap, router, execPolicy, err := s.buildRuntime(doc)
+	if err != nil {
+		return err
+	}
+
+	s.snapshot.Store(&runtimeSnapshot{
+		providers: providersMap,
+		router:    router,
+		policy:    execPolicy,
+	})
+	return nil
+}
+
+func (s *Server) buildRuntime(doc config.RuntimeConfig) (map[string]chatProvider, *routing.Router, *policy.Policy, error) {
+	providersMap := make(map[string]chatProvider, len(doc.Providers))
+	for _, p := range doc.Providers {
+		adapter, err := providers.NewAdapter(p)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		providersMap[p.Name] = adapter
+	}
+
+	var (
+		router *routing.Router
+		err    error
+	)
+	if len(doc.ModelRoutes) > 0 {
+		router, err = routing.New(&config.Config{
+			Providers:   doc.Providers,
+			ModelRoutes: doc.ModelRoutes,
+			Pricing:     doc.Pricing,
+		}, providersMap)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	execPolicy := policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
+		Catalog: billing.NewCatalog(doc.Pricing),
+		Next:    s.apiKeyStore,
+	})
+	return providersMap, router, execPolicy, nil
+}
+
+func (s *Server) currentSnapshot() *runtimeSnapshot {
+	if snapshot := s.snapshot.Load(); snapshot != nil {
+		return snapshot
+	}
+	panic("gateway runtime snapshot is not initialized")
 }
 
 func routeTargetsForLog(route modelRoute) []string {

@@ -6,3 +6,4 @@ llmio.json
 llmio.db
 dist
 deploy/.env
+api.http

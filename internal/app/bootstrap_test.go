@@ -1,38 +1,40 @@
 package app
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/jiayx/llmio/internal/config"
+	"github.com/jiayx/llmio/internal/runtimeconfig"
 )
 
 func TestBootstrapBuildsApplication(t *testing.T) {
 	dir := t.TempDir()
-	configPath := filepath.Join(dir, "llmio.json")
-	if err := os.WriteFile(configPath, []byte(`{
-		"listen": ":9090",
-		"admin_api_keys": ["secret"],
-		"database_path": "./llmio.db",
-		"providers": [
-			{
-				"name": "openai",
-				"type": "openai-compatible",
-				"base_url": "https://example.com/v1"
-			}
-		],
-		"model_routes": [
-			{
-				"external_model": "gpt-proxy",
-				"targets": [
-					{"provider": "openai", "backend_model": "gpt-4.1"}
-				]
-			}
-		]
-	}`), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
+	dbPath := filepath.Join(dir, "llmio.db")
+	store, err := runtimeconfig.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
 	}
+	if err := store.Save(config.RuntimeConfig{
+		Providers: []config.ProviderConfig{{
+			Name:    "openai",
+			Type:    "openai-compatible",
+			BaseURL: "https://example.com/v1",
+		}},
+		ModelRoutes: []config.ModelRoute{{
+			ExternalModel: "gpt-proxy",
+			Targets: []config.Target{{
+				Provider:     "openai",
+				BackendModel: "gpt-4.1",
+			}},
+		}},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	t.Setenv("LLMIO_LISTEN", ":9090")
+	t.Setenv("LLMIO_ADMIN_API_KEYS", "secret")
 
-	app, err := Bootstrap(configPath)
+	app, err := Bootstrap(dbPath)
 	if err != nil {
 		t.Fatalf("Bootstrap() error = %v", err)
 	}

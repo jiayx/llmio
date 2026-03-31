@@ -1,7 +1,4 @@
 {
-  "listen": ":18080",
-  "admin_api_keys": ["${LLMIO_ADMIN_API_KEY}"],
-  "database_path": "./llmio.db",
   "providers": [
     {
       "name": "moonshot",
@@ -22,6 +19,33 @@
       "type": "anthropic-native",
       "base_url": "https://api.anthropic.com/v1",
       "api_key": "${ANTHROPIC_API_KEY}"
+    }
+  ],
+  "pricing": [
+    {
+      "provider": "moonshot",
+      "backend_model": "moonshot-v1-8k",
+      "scheme": "openai",
+      "input_per_1m_tokens": 12,
+      "cached_input_per_1m_tokens": 6,
+      "output_per_1m_tokens": 12
+    },
+    {
+      "provider": "deepseek",
+      "backend_model": "deepseek-chat",
+      "scheme": "openai",
+      "input_per_1m_tokens": 0.27,
+      "cached_input_per_1m_tokens": 0.07,
+      "output_per_1m_tokens": 1.1
+    },
+    {
+      "provider": "anthropic",
+      "backend_model": "claude-3-5-sonnet-20241022",
+      "scheme": "anthropic",
+      "input_per_1m_tokens": 3,
+      "cache_read_input_per_1m_tokens": 0.3,
+      "cache_creation_input_per_1m_tokens": 3.75,
+      "output_per_1m_tokens": 15
     }
   ],
   "model_routes": [

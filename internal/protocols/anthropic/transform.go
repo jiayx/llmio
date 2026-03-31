@@ -53,8 +53,10 @@ func MessagesResponseFromLLM(externalModel string, resp *llm.ChatResponse) Messa
 		Role:  "assistant",
 		Model: externalModel,
 		Usage: Usage{
-			InputTokens:  resp.InputTokens,
-			OutputTokens: resp.OutputTokens,
+			InputTokens:              resp.InputTokens,
+			CacheReadInputTokens:     resp.CacheReadInputTokens,
+			CacheCreationInputTokens: resp.CacheCreationInputTokens,
+			OutputTokens:             resp.OutputTokens,
 		},
 	}
 	out.Content = llmContentToAnthropic(parts)

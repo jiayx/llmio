@@ -33,24 +33,19 @@
 - 文本、图片块、工具定义、工具调用、工具结果都已进入统一内部表示
 - OpenAI `chat/completions` 和 `responses` 都支持流式 SSE 输出，包括文本、tool call 参数增量和 reasoning 增量
 - Anthropic `messages` 支持流式 SSE 输出，包括通用 `content_block_start/delta/stop` 生命周期、`tool_use` / `input_json_delta`
-- 通过配置文件接入多个 provider
+- 通过数据库里的 runtime config 动态接入多个 provider
 - 当前已实现的 provider 类型：`openai-compatible`、`anthropic-native`
 
 ## 快速开始
 
-复制配置：
-
-```bash
-cp llmio.json.example llmio.json
-```
-
-设置密钥：
+准备环境变量：
 
 ```bash
 export MOONSHOT_API_KEY=xxx
 export DEEPSEEK_API_KEY=xxx
 export ANTHROPIC_API_KEY=xxx
-export LLMIO_ADMIN_API_KEY=xxx
+export LLMIO_ADMIN_API_KEYS=admin-secret
+export LLMIO_DATABASE_PATH=./llmio.db
 ```
 
 启动：
@@ -59,7 +54,17 @@ export LLMIO_ADMIN_API_KEY=xxx
 go run ./cmd/llmio
 ```
 
-默认监听 `:18080`，也可以通过 `llmio.json` 中的 `listen` 调整。
+默认监听 `:18080`，也可以通过 `LLMIO_LISTEN` 调整。
+
+启动后再通过管理接口写入 runtime config：
+
+```bash
+curl http://127.0.0.1:18080/admin/runtime-config \
+  -X PUT \
+  -H 'Authorization: Bearer admin-secret' \
+  -H 'Content-Type: application/json' \
+  --data @runtime-config.json.example
+```
 
 ## 部署
 
@@ -107,27 +112,43 @@ cp deploy/.env.example deploy/.env
 首次部署后，远端会自动生成：
 
 - `/etc/llmio/llmio.env`
-- `/etc/llmio/llmio.json`
+- `/etc/llmio/runtime-config.json.example`
 
-你需要按实际环境补齐其中的配置和密钥。
+你需要先补齐 `/etc/llmio/llmio.env` 里的环境变量，再用 `/admin/runtime-config` 把 provider、pricing、model route 写进数据库。
 
 ## 配置
 
-配置文件默认从 `llmio.json` 读取，也可以通过环境变量指定：
+启动配置改成环境变量：
 
 ```bash
-LLMIO_CONFIG=/path/to/llmio.json go run ./cmd/llmio
+LLMIO_DATABASE_PATH=/var/lib/llmio/llmio.db
+LLMIO_LISTEN=:18080
+LLMIO_ADMIN_API_KEYS=admin-secret
+go run ./cmd/llmio
 ```
 
-字段说明：
+runtime config 通过 `GET /admin/runtime-config` 和 `PUT /admin/runtime-config` 管理，示例文件见 [runtime-config.json.example](/Users/jiayx/workspace/jiayx/le/llmio/runtime-config.json.example)。
+
+启动环境变量：
+
+- `LLMIO_DATABASE_PATH`：SQLite 数据库路径，API key、usage、runtime config 都存这里
+- `LLMIO_LISTEN`：监听地址，默认 `:18080`
+- `LLMIO_ADMIN_API_KEYS`：管理员 API key，多个值用逗号分隔
+
+runtime config 字段说明：
 
 - `providers[].name`：provider 名称
 - `providers[].type`：后端平台类型；当前已实现 `openai-compatible`、`anthropic-native`
 - `providers[].base_url`：后端 API 的 base URL，例如 `https://api.deepseek.com/v1` 或 `https://api.anthropic.com/v1`
 - `providers[].api_key`：API Key，支持 `${ENV_NAME}` 环境变量展开
 - `providers[].supported_api_types`：声明 provider 原生支持哪些 API 类型；为空表示默认全支持。当前已用到的值包括 OpenAI 的 `chat_completions`、`responses`，以及 Anthropic 的 `messages`
-- `admin_api_keys[]`：管理接口使用的管理员 API Key
-- `database_path`：网关 SQLite 数据库文件路径；默认是配置文件目录下的 `llmio.db`
+- `pricing[]`：按 `provider + backend_model` 配置计费单价，用于给 usage 汇总 `estimated_cost_usd`
+- `pricing[].scheme`：计费口径；当前支持 `openai`、`anthropic`、`generic`
+- `pricing[].input_per_1m_tokens`：普通输入 token 单价
+- `pricing[].cached_input_per_1m_tokens`：OpenAI 风格缓存输入单价
+- `pricing[].cache_read_input_per_1m_tokens`：Anthropic prompt cache read 单价
+- `pricing[].cache_creation_input_per_1m_tokens`：Anthropic prompt cache write 单价
+- `pricing[].output_per_1m_tokens`：输出 token 单价
 - `model_routes[].external_model`：对客户端暴露的模型名
 - `model_routes[].targets[]`：按顺序尝试的 provider 目标列表
 - `model_routes[].targets[].provider`：命中的 provider
@@ -148,6 +169,48 @@ passthrough 的判定规则是：
 ```
 
 写进 provider 配置。这样客户端调用 `/v1/responses` 时，网关不会再去打后端的 `/responses`，而是自动转换到内部模型再通过 `/chat/completions` 落到后端。
+
+runtime config 示例：
+
+```json
+{
+  "providers": [
+    {
+      "name": "openai-prod",
+      "type": "openai-compatible",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}"
+    }
+  ],
+  "pricing": [
+    {
+      "provider": "openai-prod",
+      "backend_model": "gpt-5.4",
+      "scheme": "openai",
+      "input_per_1m_tokens": 2.5,
+      "cached_input_per_1m_tokens": 0.25,
+      "output_per_1m_tokens": 15
+    },
+    {
+      "provider": "anthropic-prod",
+      "backend_model": "claude-sonnet-4",
+      "scheme": "anthropic",
+      "input_per_1m_tokens": 3,
+      "cache_read_input_per_1m_tokens": 0.3,
+      "cache_creation_input_per_1m_tokens": 3.75,
+      "output_per_1m_tokens": 15
+    }
+  ]
+}
+```
+
+启用后，管理接口返回的 usage 会额外带：
+
+- `priced_request_count`
+- `estimated_cost_usd`
+- `cached_input_tokens`
+- `cache_read_input_tokens`
+- `cache_creation_input_tokens`
 
 ## 架构方向
 
@@ -184,27 +247,48 @@ curl http://127.0.0.1:8080/admin/api-keys \
   -H 'Authorization: Bearer admin-secret' \
   -H 'Content-Type: application/json' \
   -d '{
-    "name": "crm-system"
+    "name": "crm-system",
+    "budget_usd": 20
   }'
 ```
 
 返回里会包含一次性的 `secret`，后续业务系统拿这个 key 调用 LLM 接口。
+如果设置了 `budget_usd`，超出预算后该 key 会被网关拒绝继续调用。
 
-查看业务 API Key 和累计 token：
+查看业务 API Key 和累计 token / 费用：
 
 ```bash
 curl http://127.0.0.1:8080/admin/api-keys \
   -H 'Authorization: Bearer admin-secret'
 ```
 
-查看所有 API Key 的 token 用量汇总：
+### Runtime Config
+
+查看当前 runtime config：
+
+```bash
+curl http://127.0.0.1:8080/admin/runtime-config \
+  -H 'Authorization: Bearer admin-secret'
+```
+
+更新 runtime config：
+
+```bash
+curl http://127.0.0.1:8080/admin/runtime-config \
+  -X PUT \
+  -H 'Authorization: Bearer admin-secret' \
+  -H 'Content-Type: application/json' \
+  --data @runtime-config.json.example
+```
+
+查看所有 API Key 的 token / 费用汇总：
 
 ```bash
 curl http://127.0.0.1:8080/admin/usage \
   -H 'Authorization: Bearer admin-secret'
 ```
 
-查看单个 API Key 的 token 用量：
+查看单个 API Key 的 token / 费用：
 
 ```bash
 curl http://127.0.0.1:8080/admin/api-keys/key_xxx/usage \

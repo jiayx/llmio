@@ -78,9 +78,10 @@ func WriteChatCompletionResponse(w http.ResponseWriter, externalModel string, re
 		Model:   externalModel,
 		Choices: []Choice{{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls, ReasoningContent: reasoningContent}, FinishReason: resp.FinishReason}},
 		Usage: &CompletionUsage{
-			PromptTokens:     resp.InputTokens,
-			CompletionTokens: resp.OutputTokens,
-			TotalTokens:      resp.InputTokens + resp.OutputTokens,
+			PromptTokens:        resp.InputTokens,
+			PromptTokensDetails: openAIPromptTokenDetails(resp.CachedInputTokens),
+			CompletionTokens:    resp.OutputTokens,
+			TotalTokens:         resp.InputTokens + resp.OutputTokens,
 		},
 	})
 }
@@ -97,9 +98,10 @@ func WriteResponsesResponse(w http.ResponseWriter, externalModel string, resp *l
 		Output:     responseOutputItems(parts),
 		OutputText: resp.OutputText,
 		Usage: &ResponseUsage{
-			InputTokens:  resp.InputTokens,
-			OutputTokens: resp.OutputTokens,
-			TotalTokens:  resp.InputTokens + resp.OutputTokens,
+			InputTokens:        resp.InputTokens,
+			InputTokensDetails: openAIInputTokenDetails(resp.CachedInputTokens),
+			OutputTokens:       resp.OutputTokens,
+			TotalTokens:        resp.InputTokens + resp.OutputTokens,
 		},
 	})
 }
@@ -251,6 +253,7 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 	var output strings.Builder
 	var reasoning strings.Builder
 	inputTokens := 0
+	cachedInputTokens := 0
 	outputTokens := 0
 	toolStates := make(map[string]*streamToolState)
 	toolOrder := make([]string, 0)
@@ -270,9 +273,10 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 					Output:     responseOutputItems(streamResponseParts(output.String(), reasoning.String(), imageBlocks, imageOrder, toolStates, toolOrder)),
 					OutputText: output.String(),
 					Usage: &ResponseUsage{
-						InputTokens:  inputTokens,
-						OutputTokens: outputTokens,
-						TotalTokens:  inputTokens + outputTokens,
+						InputTokens:        inputTokens,
+						InputTokensDetails: openAIInputTokenDetails(cachedInputTokens),
+						OutputTokens:       outputTokens,
+						TotalTokens:        inputTokens + outputTokens,
 					},
 				})
 				flusher.Flush()
@@ -354,6 +358,7 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 				}
 			case llm.StreamEventUsage:
 				inputTokens = event.InputTokens
+				cachedInputTokens = event.CachedInputTokens
 				outputTokens = event.OutputTokens
 			case llm.StreamEventStop:
 				httpio.WriteSSEJSON(w, "response.output_text.done", map[string]any{
@@ -389,9 +394,10 @@ func ServeResponsesStream(w http.ResponseWriter, r *http.Request, externalModel 
 					Output:     responseOutputItems(streamResponseParts(output.String(), reasoning.String(), imageBlocks, imageOrder, toolStates, toolOrder)),
 					OutputText: output.String(),
 					Usage: &ResponseUsage{
-						InputTokens:  inputTokens,
-						OutputTokens: outputTokens,
-						TotalTokens:  inputTokens + outputTokens,
+						InputTokens:        inputTokens,
+						InputTokensDetails: openAIInputTokenDetails(cachedInputTokens),
+						OutputTokens:       outputTokens,
+						TotalTokens:        inputTokens + outputTokens,
 					},
 				})
 				flusher.Flush()
@@ -417,6 +423,20 @@ func rewritePassthroughJSONPayload(data []byte, externalModel string) ([]byte, e
 	}
 	rewriteMapModel(payload, externalModel)
 	return json.Marshal(payload)
+}
+
+func openAIPromptTokenDetails(cachedTokens int) *PromptTokenDetails {
+	if cachedTokens <= 0 {
+		return nil
+	}
+	return &PromptTokenDetails{CachedTokens: cachedTokens}
+}
+
+func openAIInputTokenDetails(cachedTokens int) *InputTokenDetails {
+	if cachedTokens <= 0 {
+		return nil
+	}
+	return &InputTokenDetails{CachedTokens: cachedTokens}
 }
 
 func rewriteMapModel(m map[string]any, model string) {

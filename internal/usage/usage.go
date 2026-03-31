@@ -8,20 +8,25 @@ import (
 
 // Event captures one successful model usage record.
 type Event struct {
-	Timestamp     time.Time
-	APIKeyID      string
-	APIKeyName    string
-	ProviderName  string
-	ExternalModel string
-	BackendModel  string
-	Protocol      string
-	APIType       string
-	InputTokens   int
-	OutputTokens  int
-	TotalTokens   int
-	Stream        bool
-	Passthrough   bool
-	UsageKnown    bool
+	Timestamp                time.Time
+	APIKeyID                 string
+	APIKeyName               string
+	ProviderName             string
+	ExternalModel            string
+	BackendModel             string
+	Protocol                 string
+	APIType                  string
+	InputTokens              int
+	CachedInputTokens        int
+	CacheReadInputTokens     int
+	CacheCreationInputTokens int
+	OutputTokens             int
+	TotalTokens              int
+	EstimatedCostUSD         float64
+	CostKnown                bool
+	Stream                   bool
+	Passthrough              bool
+	UsageKnown               bool
 }
 
 // Recorder stores or emits usage events.
@@ -44,8 +49,13 @@ func (SlogRecorder) Record(_ context.Context, event Event) {
 		"protocol", event.Protocol,
 		"api_type", event.APIType,
 		"input_tokens", event.InputTokens,
+		"cached_input_tokens", event.CachedInputTokens,
+		"cache_read_input_tokens", event.CacheReadInputTokens,
+		"cache_creation_input_tokens", event.CacheCreationInputTokens,
 		"output_tokens", event.OutputTokens,
 		"total_tokens", event.TotalTokens,
+		"estimated_cost_usd", event.EstimatedCostUSD,
+		"cost_known", event.CostKnown,
 		"stream", event.Stream,
 		"passthrough", event.Passthrough,
 		"usage_known", event.UsageKnown,

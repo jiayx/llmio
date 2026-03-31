@@ -96,9 +96,10 @@ func ResponsesResponseFromLLM(externalModel string, resp *llm.ChatResponse) Resp
 		Output:     responseOutputItems(parts),
 		OutputText: resp.OutputText,
 		Usage: &ResponseUsage{
-			InputTokens:  resp.InputTokens,
-			OutputTokens: resp.OutputTokens,
-			TotalTokens:  resp.InputTokens + resp.OutputTokens,
+			InputTokens:        resp.InputTokens,
+			InputTokensDetails: openAIInputTokenDetails(resp.CachedInputTokens),
+			OutputTokens:       resp.OutputTokens,
+			TotalTokens:        resp.InputTokens + resp.OutputTokens,
 		},
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/jiayx/llmio/internal/apikeys"
+	"github.com/jiayx/llmio/internal/billing"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
 	"github.com/jiayx/llmio/internal/policy"
@@ -113,11 +114,13 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 
 	providersMap := map[string]chatProvider{
 		"primary": fakeProvider{chatResp: &llm.ChatResponse{
-			ID:           "resp_1",
-			Model:        "backend-model",
-			OutputText:   "hello",
-			InputTokens:  11,
-			OutputTokens: 7,
+			ID:                   "resp_1",
+			Model:                "backend-model",
+			OutputText:           "hello",
+			InputTokens:          11,
+			CachedInputTokens:    5,
+			CacheReadInputTokens: 5,
+			OutputTokens:         7,
 		}},
 	}
 	router, err := routing.New(&config.Config{
@@ -138,19 +141,28 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 		t.Fatalf("routing.New() error = %v", err)
 	}
 
-	s := &Server{
-		adminAPIKeys: map[string]apikeys.Principal{
-			"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
-		},
-		apiKeyStore:      store,
-		providers:        providersMap,
-		router:           router,
-		policy:           policy.NewWithRecorder(policy.DefaultConfig(), providersMap, usage.MultiRecorder{store}),
-		protocolAdapters: protocols.DefaultAdapters(),
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    router,
+		policy: policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
+			Catalog: billing.NewCatalog([]config.PricingRule{{
+				Provider:               "primary",
+				BackendModel:           "backend-model",
+				Scheme:                 "openai",
+				InputPer1MTokens:       2.5,
+				CachedInputPer1MTokens: 0.25,
+				OutputPer1MTokens:      15,
+			}}),
+			Next: usage.MultiRecorder{store},
+		}),
+	})
+	s.adminAPIKeys = map[string]apikeys.Principal{
+		"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
 	}
+	s.apiKeyStore = store
 	handler := s.Handler()
 
-	createReq := httptest.NewRequest(http.MethodPost, "/admin/api-keys", strings.NewReader(`{"name":"crm-system"}`))
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/api-keys", strings.NewReader(`{"name":"crm-system","budget_usd":0.01}`))
 	createReq.Header.Set("Authorization", "Bearer admin-secret")
 	createReq.Header.Set("Content-Type", "application/json")
 	createRec := httptest.NewRecorder()
@@ -161,7 +173,9 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 
 	var created struct {
 		Key struct {
-			ID string `json:"id"`
+			ID                 string   `json:"id"`
+			BudgetUSD          *float64 `json:"budget_usd"`
+			RemainingBudgetUSD *float64 `json:"remaining_budget_usd"`
 		} `json:"key"`
 		Secret string `json:"secret"`
 	}
@@ -169,6 +183,9 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 		t.Fatalf("unmarshal create = %v", err)
 	}
 	if created.Key.ID == "" || created.Secret == "" {
+		t.Fatalf("create body = %s", createRec.Body.String())
+	}
+	if created.Key.BudgetUSD == nil || *created.Key.BudgetUSD != 0.01 {
 		t.Fatalf("create body = %s", createRec.Body.String())
 	}
 
@@ -193,7 +210,22 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 	if err := json.Unmarshal(getRec.Body.Bytes(), &key); err != nil {
 		t.Fatalf("unmarshal get = %v", err)
 	}
-	if key.Usage.RequestCount != 1 || key.Usage.InputTokens != 11 || key.Usage.OutputTokens != 7 || key.Usage.TotalTokens != 18 {
+	if key.Usage.RequestCount != 1 || key.Usage.InputTokens != 11 || key.Usage.CachedInputTokens != 5 || key.Usage.OutputTokens != 7 || key.Usage.TotalTokens != 18 {
+		t.Fatalf("usage = %#v", key.Usage)
+	}
+	if key.BudgetUSD == nil || *key.BudgetUSD != 0.01 {
+		t.Fatalf("key = %#v", key)
+	}
+	if key.RemainingBudgetUSD == nil {
+		t.Fatalf("key = %#v", key)
+	}
+	if diff := *key.RemainingBudgetUSD - (0.01 - 0.00012125); diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("key = %#v", key)
+	}
+	if key.Usage.PricedRequestCount != 1 {
+		t.Fatalf("usage = %#v", key.Usage)
+	}
+	if diff := key.Usage.EstimatedCostUSD - 0.00012125; diff < -1e-12 || diff > 1e-12 {
 		t.Fatalf("usage = %#v", key.Usage)
 	}
 
@@ -210,6 +242,15 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 		t.Fatalf("unmarshal usage = %v", err)
 	}
 	if singleUsage.KeyID != created.Key.ID || singleUsage.Usage.TotalTokens != 18 {
+		t.Fatalf("singleUsage = %#v", singleUsage)
+	}
+	if singleUsage.RemainingBudgetUSD == nil {
+		t.Fatalf("singleUsage = %#v", singleUsage)
+	}
+	if diff := *singleUsage.RemainingBudgetUSD - (0.01 - 0.00012125); diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("singleUsage = %#v", singleUsage)
+	}
+	if diff := singleUsage.Usage.EstimatedCostUSD - 0.00012125; diff < -1e-12 || diff > 1e-12 {
 		t.Fatalf("singleUsage = %#v", singleUsage)
 	}
 
@@ -231,6 +272,211 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 	if usageList.Total.TotalTokens != 18 || len(usageList.Data) != 1 || usageList.Data[0].KeyID != created.Key.ID {
 		t.Fatalf("usageList = %#v", usageList)
 	}
+	if diff := usageList.Total.EstimatedCostUSD - 0.00012125; diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("usageList = %#v", usageList)
+	}
+	if usageList.Data[0].RemainingBudgetUSD == nil {
+		t.Fatalf("usageList = %#v", usageList)
+	}
+	if diff := *usageList.Data[0].RemainingBudgetUSD - (0.01 - 0.00012125); diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("usageList = %#v", usageList)
+	}
+}
+
+func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
+	store, err := apikeys.Open(filepath.Join(t.TempDir(), "apikeys.json"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	providersMap := map[string]chatProvider{
+		"primary": fakeProvider{chatResp: &llm.ChatResponse{
+			ID:           "resp_1",
+			Model:        "backend-model",
+			OutputText:   "hello",
+			InputTokens:  1000,
+			OutputTokens: 1000,
+		}},
+	}
+	router, err := routing.New(&config.Config{
+		Providers: []config.ProviderConfig{{
+			Name:    "primary",
+			Type:    "openai-compatible",
+			BaseURL: "https://example.com/v1",
+		}},
+		ModelRoutes: []config.ModelRoute{{
+			ExternalModel: "gpt-proxy",
+			Targets: []config.Target{{
+				Provider:     "primary",
+				BackendModel: "backend-model",
+			}},
+		}},
+	}, providersMap)
+	if err != nil {
+		t.Fatalf("routing.New() error = %v", err)
+	}
+
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    router,
+		policy: policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
+			Catalog: billing.NewCatalog([]config.PricingRule{{
+				Provider:          "primary",
+				BackendModel:      "backend-model",
+				Scheme:            "generic",
+				InputPer1MTokens:  1000,
+				OutputPer1MTokens: 1000,
+			}}),
+			Next: usage.MultiRecorder{store},
+		}),
+	})
+	s.adminAPIKeys = map[string]apikeys.Principal{
+		"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
+	}
+	s.apiKeyStore = store
+	handler := s.Handler()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/api-keys", strings.NewReader(`{"name":"limited","budget_usd":0.001}`))
+	createReq.Header.Set("Authorization", "Bearer admin-secret")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	var created struct {
+		Secret string `json:"secret"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create = %v", err)
+	}
+
+	callReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-proxy","messages":[{"role":"user","content":"hi"}]}`))
+	callReq.Header.Set("Authorization", "Bearer "+created.Secret)
+	callReq.Header.Set("Content-Type", "application/json")
+	callRec := httptest.NewRecorder()
+	handler.ServeHTTP(callRec, callReq)
+	if callRec.Code != http.StatusOK {
+		t.Fatalf("call status = %d body=%s", callRec.Code, callRec.Body.String())
+	}
+
+	blockedReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-proxy","messages":[{"role":"user","content":"hi"}]}`))
+	blockedReq.Header.Set("Authorization", "Bearer "+created.Secret)
+	blockedReq.Header.Set("Content-Type", "application/json")
+	blockedRec := httptest.NewRecorder()
+	handler.ServeHTTP(blockedRec, blockedReq)
+	if blockedRec.Code != http.StatusPaymentRequired {
+		t.Fatalf("blocked status = %d body=%s", blockedRec.Code, blockedRec.Body.String())
+	}
+}
+
+func TestAdminRuntimeConfigHotReload(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "llmio.db")
+	s, err := NewServer(&config.Config{
+		DatabasePath:  dbPath,
+		AdminAPIKeys:  []string{"admin-secret"},
+		Providers:     nil,
+		ModelRoutes:   nil,
+		Pricing:       nil,
+	})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	handler := s.Handler()
+
+	getReq := httptest.NewRequest(http.MethodGet, "/admin/runtime-config", nil)
+	getReq.Header.Set("Authorization", "Bearer admin-secret")
+	getRec := httptest.NewRecorder()
+	handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("initial get status = %d body=%s", getRec.Code, getRec.Body.String())
+	}
+
+	var initial config.RuntimeConfig
+	if err := json.Unmarshal(getRec.Body.Bytes(), &initial); err != nil {
+		t.Fatalf("unmarshal initial runtime config = %v", err)
+	}
+	if len(initial.Providers) != 0 || len(initial.ModelRoutes) != 0 || len(initial.Pricing) != 0 {
+		t.Fatalf("initial runtime config = %#v", initial)
+	}
+
+	body := `{
+		"providers":[
+			{
+				"name":"primary",
+				"type":"openai-compatible",
+				"base_url":"https://example.com/v1"
+			}
+		],
+		"model_routes":[
+			{
+				"external_model":"gpt-proxy",
+				"targets":[
+					{
+						"provider":"primary",
+						"backend_model":"backend-model"
+					}
+				]
+			}
+		],
+		"pricing":[
+			{
+				"provider":"primary",
+				"backend_model":"backend-model",
+				"scheme":"openai",
+				"input_per_1m_tokens":2.5,
+				"cached_input_per_1m_tokens":0.25,
+				"output_per_1m_tokens":15
+			}
+		]
+	}`
+	putReq := httptest.NewRequest(http.MethodPut, "/admin/runtime-config", strings.NewReader(body))
+	putReq.Header.Set("Authorization", "Bearer admin-secret")
+	putReq.Header.Set("Content-Type", "application/json")
+	putRec := httptest.NewRecorder()
+	handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("put status = %d body=%s", putRec.Code, putRec.Body.String())
+	}
+
+	var updated config.RuntimeConfig
+	if err := json.Unmarshal(putRec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("unmarshal updated runtime config = %v", err)
+	}
+	if len(updated.Providers) != 1 || len(updated.ModelRoutes) != 1 || len(updated.Pricing) != 1 {
+		t.Fatalf("updated runtime config = %#v", updated)
+	}
+
+	route, ok := s.resolveRoute("gpt-proxy")
+	if !ok {
+		t.Fatalf("route not found after hot reload")
+	}
+	if len(route.Targets) != 1 || route.Targets[0].ProviderName != "primary" || route.Targets[0].BackendModel != "backend-model" {
+		t.Fatalf("route = %#v", route)
+	}
+
+	models := s.modelInfos()
+	if len(models) != 1 || models[0].ID != "gpt-proxy" {
+		t.Fatalf("models = %#v", models)
+	}
+
+	reloadReq := httptest.NewRequest(http.MethodGet, "/admin/runtime-config", nil)
+	reloadReq.Header.Set("Authorization", "Bearer admin-secret")
+	reloadRec := httptest.NewRecorder()
+	handler.ServeHTTP(reloadRec, reloadReq)
+	if reloadRec.Code != http.StatusOK {
+		t.Fatalf("reload get status = %d body=%s", reloadRec.Code, reloadRec.Body.String())
+	}
+
+	var persisted config.RuntimeConfig
+	if err := json.Unmarshal(reloadRec.Body.Bytes(), &persisted); err != nil {
+		t.Fatalf("unmarshal persisted runtime config = %v", err)
+	}
+	if len(persisted.Providers) != 1 || persisted.Providers[0].Name != "primary" {
+		t.Fatalf("persisted runtime config = %#v", persisted)
+	}
 }
 
 func TestDisabledManagedAPIKeyCannotCallLLM(t *testing.T) {
@@ -238,7 +484,7 @@ func TestDisabledManagedAPIKeyCannotCallLLM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	created, err := store.Create("worker")
+	created, err := store.Create("worker", nil)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
@@ -326,16 +572,18 @@ func TestRecoveryReturnsAnthropic500(t *testing.T) {
 }
 
 func TestDispatchChatFallback(t *testing.T) {
-	s := &Server{
-		providers: map[string]chatProvider{
-			"primary": fakeProvider{chatErr: errors.New("provider primary returned status 503: busy")},
-			"secondary": fakeProvider{chatResp: &llm.ChatResponse{
-				ID:         "ok",
-				Model:      "deepseek-chat",
-				OutputText: "hi",
-			}},
-		},
+	providersMap := map[string]chatProvider{
+		"primary": fakeProvider{chatErr: errors.New("provider primary returned status 503: busy")},
+		"secondary": fakeProvider{chatResp: &llm.ChatResponse{
+			ID:         "ok",
+			Model:      "deepseek-chat",
+			OutputText: "hi",
+		}},
 	}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	resp, err := s.dispatchChat(context.Background(), modelRoute{
 		Targets: []routeTarget{
@@ -508,19 +756,19 @@ func TestLLMResponseToOpenAIResponse(t *testing.T) {
 }
 
 func TestHandleOpenAIResponses(t *testing.T) {
-	s := &Server{
-		providers: map[string]chatProvider{
-			"primary": fakeProvider{chatResp: &llm.ChatResponse{
-				ID:           "resp_1",
-				OutputText:   "world",
-				InputTokens:  3,
-				OutputTokens: 4,
-			}},
-		},
-		router: mustTestRouter(t, map[string]chatProvider{
-			"primary": fakeProvider{},
-		}, "gpt-proxy", "primary", "backend-model"),
+	providersMap := map[string]chatProvider{
+		"primary": fakeProvider{chatResp: &llm.ChatResponse{
+			ID:           "resp_1",
+			OutputText:   "world",
+			InputTokens:  3,
+			OutputTokens: 4,
+		}},
 	}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    mustTestRouter(t, providersMap, "gpt-proxy", "primary", "backend-model"),
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
 		"model": "gpt-proxy",
@@ -655,7 +903,7 @@ func TestNewServerAnthropicNativeProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
-	if _, ok := server.providers["anthropic"]; !ok {
+	if _, ok := server.currentSnapshot().providers["anthropic"]; !ok {
 		t.Fatalf("provider not registered")
 	}
 }
@@ -671,10 +919,12 @@ func TestHandleOpenAIChatCompletionsPassthrough(t *testing.T) {
 			Body: io.NopCloser(strings.NewReader(`{"id":"1","model":"backend-model","choices":[]}`)),
 		},
 	}
-	s := &Server{
-		providers: map[string]chatProvider{"p": p},
-		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "gpt-proxy", "p", "backend-model"),
-	}
+	providersMap := map[string]chatProvider{"p": p}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-proxy","messages":[{"role":"user","content":"hello"}]}`))
 	rec := httptest.NewRecorder()
@@ -708,10 +958,12 @@ func TestHandleOpenAIResponsesPassthrough(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_1","object":"response","model":"backend-model","status":"completed","output":[]}`)),
 		},
 	}
-	s := &Server{
-		providers: map[string]chatProvider{"p": p},
-		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "gpt-proxy", "p", "backend-model"),
-	}
+	providersMap := map[string]chatProvider{"p": p}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-proxy","input":"hello"}`))
 	rec := httptest.NewRecorder()
@@ -737,10 +989,12 @@ func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 			providerapi.OpenAIAPIChatCompletions: {},
 		},
 	}
-	s := &Server{
-		providers: map[string]chatProvider{"p": p},
-		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "gpt-proxy", "p", "backend-model"),
-	}
+	providersMap := map[string]chatProvider{"p": p}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-proxy","input":"hello"}`))
 	rec := httptest.NewRecorder()
@@ -801,10 +1055,12 @@ func TestHandleAnthropicMessagesPassthrough(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1","type":"message","model":"backend-model","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":1}}`)),
 		},
 	}
-	s := &Server{
-		providers: map[string]chatProvider{"p": p},
-		router:    mustTestRouter(t, map[string]chatProvider{"p": p}, "claude-proxy", "p", "backend-model"),
-	}
+	providersMap := map[string]chatProvider{"p": p}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    mustTestRouter(t, providersMap, "claude-proxy", "p", "backend-model"),
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"claude-proxy","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`))
 	rec := httptest.NewRecorder()
@@ -851,9 +1107,11 @@ func TestHandleOpenAIStreamToolCall(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolInput: `lo"}`},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "tool_calls"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 
@@ -869,9 +1127,11 @@ func TestHandleOpenAIStreamReasoning(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventDelta, Part: llm.ContentPart{Type: llm.ContentTypeReasoning}, TextDelta: "think"},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "stop"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 
@@ -887,9 +1147,11 @@ func TestHandleOpenAIResponsesStreamToolCall(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventTool, ToolIndex: 0, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hi"}`},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "tool_calls"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
 
@@ -907,9 +1169,11 @@ func TestHandleOpenAIResponsesStreamReasoningAndImage(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventContentStop, BlockIndex: 1, Part: llm.ContentPart{Type: llm.ContentTypeImage, URL: "https://example.com/image.png"}},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "stop"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
 
@@ -926,15 +1190,17 @@ func TestHandleOpenAIResponsesStreamContextCanceledDoesNotWrite502(t *testing.T)
 	errs <- context.Canceled
 	close(errs)
 
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: &providerapi.StreamReader{
-			Events: events,
-			Err:    errs,
-			Close: func() error {
-				return nil
-			},
-		}}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: &providerapi.StreamReader{
+		Events: events,
+		Err:    errs,
+		Close: func() error {
+			return nil
+		},
+	}}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	rec := httptest.NewRecorder()
 
@@ -952,9 +1218,11 @@ func TestHandleAnthropicStreamToolCall(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventTool, ToolCallID: "call_1", ToolName: "lookup", ToolInput: `{"q":"hi"}`},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "tool_use"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
 	rec := httptest.NewRecorder()
 
@@ -971,9 +1239,11 @@ func TestHandleAnthropicStreamImageBlock(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventContentStop, BlockIndex: 2, Part: llm.ContentPart{Type: llm.ContentTypeImage, MediaType: "image/png", Data: "abc"}},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "end_turn"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
 	rec := httptest.NewRecorder()
 
@@ -989,10 +1259,12 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 		llm.StreamEvent{Type: llm.StreamEventDelta, Part: llm.ContentPart{Type: llm.ContentTypeText}, TextDelta: "hello"},
 		llm.StreamEvent{Type: llm.StreamEventStop, FinishReason: "end_turn"},
 	)
-	s := &Server{
-		providers: map[string]chatProvider{"p": fakeProvider{stream: stream}},
-		router:    mustTestRouter(t, map[string]chatProvider{"p": fakeProvider{}}, "claude-proxy", "p", "x"),
-	}
+	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
+	s := newTestServerWithSnapshot(runtimeSnapshot{
+		providers: providersMap,
+		router:    mustTestRouter(t, providersMap, "claude-proxy", "p", "x"),
+		policy:    policy.New(policy.DefaultConfig(), providersMap),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{
 		"model":"claude-proxy",
@@ -1152,4 +1424,12 @@ func mustTestRouter(t *testing.T, providers map[string]chatProvider, externalMod
 		t.Fatalf("routing.New() error = %v", err)
 	}
 	return router
+}
+
+func newTestServerWithSnapshot(snapshot runtimeSnapshot) *Server {
+	s := &Server{
+		protocolAdapters: protocols.DefaultAdapters(),
+	}
+	s.snapshot.Store(&snapshot)
+	return s
 }

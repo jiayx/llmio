@@ -47,12 +47,15 @@ func MessagesRequestFromLLM(req llm.ChatRequest) MessagesRequest {
 // MessagesResponseToLLM decodes one Anthropic messages payload into the internal response model.
 func MessagesResponseToLLM(resp MessagesResponse, raw []byte) *llm.ChatResponse {
 	out := &llm.ChatResponse{
-		ID:           resp.ID,
-		Model:        resp.Model,
-		FinishReason: resp.StopReason,
-		InputTokens:  resp.Usage.InputTokens,
-		OutputTokens: resp.Usage.OutputTokens,
-		Raw:          raw,
+		ID:                       resp.ID,
+		Model:                    resp.Model,
+		FinishReason:             resp.StopReason,
+		InputTokens:              resp.Usage.InputTokens,
+		CachedInputTokens:        resp.Usage.CacheReadInputTokens,
+		CacheReadInputTokens:     resp.Usage.CacheReadInputTokens,
+		CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
+		OutputTokens:             resp.Usage.OutputTokens,
+		Raw:                      raw,
 	}
 	out.Output = contentBlocksToLLM(resp.Content)
 	out.OutputText = llm.ExtractText(out.Output)
@@ -68,9 +71,12 @@ func SSEEventToLLMEvents(eventName, payload string, blockState map[int]ContentBl
 			return fmt.Errorf("decode anthropic message_start: %w", err)
 		}
 		out <- llm.StreamEvent{
-			Type:        llm.StreamEventUsage,
-			InputTokens: event.Message.Usage.InputTokens,
-			Raw:         json.RawMessage(payload),
+			Type:                     llm.StreamEventUsage,
+			InputTokens:              event.Message.Usage.InputTokens,
+			CachedInputTokens:        event.Message.Usage.CacheReadInputTokens,
+			CacheReadInputTokens:     event.Message.Usage.CacheReadInputTokens,
+			CacheCreationInputTokens: event.Message.Usage.CacheCreationInputTokens,
+			Raw:                      json.RawMessage(payload),
 		}
 	case "content_block_start":
 		var event StreamContentBlockStart
@@ -149,9 +155,12 @@ func SSEEventToLLMEvents(eventName, payload string, blockState map[int]ContentBl
 		}
 		if event.Usage.OutputTokens > 0 {
 			out <- llm.StreamEvent{
-				Type:         llm.StreamEventUsage,
-				OutputTokens: event.Usage.OutputTokens,
-				Raw:          json.RawMessage(payload),
+				Type:                     llm.StreamEventUsage,
+				OutputTokens:             event.Usage.OutputTokens,
+				CacheReadInputTokens:     event.Usage.CacheReadInputTokens,
+				CacheCreationInputTokens: event.Usage.CacheCreationInputTokens,
+				CachedInputTokens:        event.Usage.CacheReadInputTokens,
+				Raw:                      json.RawMessage(payload),
 			}
 		}
 		if event.Delta.StopReason != "" {

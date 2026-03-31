@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +14,25 @@ type Config struct {
 	AdminAPIKeys []string         `json:"admin_api_keys"`
 	DatabasePath string           `json:"database_path"`
 	Providers    []ProviderConfig `json:"providers"`
+	Pricing      []PricingRule    `json:"pricing,omitempty"`
 	ModelRoutes  []ModelRoute     `json:"model_routes"`
+}
+
+type RuntimeConfig struct {
+	Providers   []ProviderConfig `json:"providers"`
+	Pricing     []PricingRule    `json:"pricing,omitempty"`
+	ModelRoutes []ModelRoute     `json:"model_routes"`
+}
+
+type PricingRule struct {
+	Provider                      string  `json:"provider"`
+	BackendModel                  string  `json:"backend_model"`
+	Scheme                        string  `json:"scheme,omitempty"`
+	InputPer1MTokens              float64 `json:"input_per_1m_tokens"`
+	CachedInputPer1MTokens        float64 `json:"cached_input_per_1m_tokens,omitempty"`
+	CacheReadInputPer1MTokens     float64 `json:"cache_read_input_per_1m_tokens,omitempty"`
+	CacheCreationInputPer1MTokens float64 `json:"cache_creation_input_per_1m_tokens,omitempty"`
+	OutputPer1MTokens             float64 `json:"output_per_1m_tokens"`
 }
 
 // ProviderConfig defines a backend provider endpoint and its auth settings.
@@ -45,25 +62,36 @@ type Target struct {
 	IgnoreRequestFields []string `json:"ignore_request_fields,omitempty"`
 }
 
-// Load reads, expands, validates, and normalizes a gateway config file.
-func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+func ResolveProviderConfig(cfg ProviderConfig) (ProviderConfig, error) {
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	if cfg.APIKey == "" {
+		return cfg, nil
+	}
+	if !strings.Contains(cfg.APIKey, "${") {
+		return cfg, nil
 	}
 
-	data = []byte(os.ExpandEnv(string(data)))
-
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("decode %s: %w", path, err)
+	envName, ok := parseEnvReference(cfg.APIKey)
+	if !ok {
+		return ProviderConfig{}, fmt.Errorf("provider %q api_key must be plaintext or ${ENV_NAME}", cfg.Name)
 	}
+	value, exists := os.LookupEnv(envName)
+	if !exists {
+		return ProviderConfig{}, fmt.Errorf("provider %q api_key env %q is not set", cfg.Name, envName)
+	}
+	cfg.APIKey = value
+	return cfg, nil
+}
 
+func Prepare(cfg *Config, baseDir string) error {
+	if cfg == nil {
+		return fmt.Errorf("config is required")
+	}
 	if len(cfg.Providers) == 0 {
-		return nil, fmt.Errorf("config.providers is required")
+		return fmt.Errorf("config.providers is required")
 	}
 	if len(cfg.ModelRoutes) == 0 {
-		return nil, fmt.Errorf("config.model_routes is required")
+		return fmt.Errorf("config.model_routes is required")
 	}
 
 	providerNames := make(map[string]struct{}, len(cfg.Providers))
@@ -71,10 +99,10 @@ func Load(path string) (*Config, error) {
 		p := &cfg.Providers[i]
 		p.Name = strings.TrimSpace(p.Name)
 		if p.Name == "" {
-			return nil, fmt.Errorf("config.providers[%d].name is required", i)
+			return fmt.Errorf("config.providers[%d].name is required", i)
 		}
 		if _, exists := providerNames[p.Name]; exists {
-			return nil, fmt.Errorf("duplicate provider %q", p.Name)
+			return fmt.Errorf("duplicate provider %q", p.Name)
 		}
 		providerNames[p.Name] = struct{}{}
 		p.Type = strings.ToLower(strings.TrimSpace(p.Type))
@@ -83,7 +111,7 @@ func Load(path string) (*Config, error) {
 		}
 		p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
 		if p.BaseURL == "" {
-			return nil, fmt.Errorf("provider %q base_url is required", p.Name)
+			return fmt.Errorf("provider %q base_url is required", p.Name)
 		}
 		if p.ModelsPath == "" {
 			p.ModelsPath = "/models"
@@ -104,23 +132,23 @@ func Load(path string) (*Config, error) {
 	}
 	cfg.DatabasePath = strings.TrimSpace(cfg.DatabasePath)
 	if cfg.DatabasePath == "" {
-		cfg.DatabasePath = filepath.Join(filepath.Dir(path), "llmio.db")
+		cfg.DatabasePath = filepath.Join(baseDir, "llmio.db")
 	} else if !filepath.IsAbs(cfg.DatabasePath) {
-		cfg.DatabasePath = filepath.Join(filepath.Dir(path), cfg.DatabasePath)
+		cfg.DatabasePath = filepath.Join(baseDir, cfg.DatabasePath)
 	}
 
 	for i := range cfg.ModelRoutes {
 		route := &cfg.ModelRoutes[i]
 		route.ExternalModel = strings.TrimSpace(route.ExternalModel)
 		if route.ExternalModel == "" {
-			return nil, fmt.Errorf("config.model_routes[%d].external_model is required", i)
+			return fmt.Errorf("config.model_routes[%d].external_model is required", i)
 		}
 		if len(route.Targets) == 0 {
 			route.Provider = strings.TrimSpace(route.Provider)
 			route.BackendModel = strings.TrimSpace(route.BackendModel)
 			route.IgnoreRequestFields = normalizeRequestFields(route.IgnoreRequestFields)
 			if route.Provider == "" || route.BackendModel == "" {
-				return nil, fmt.Errorf("model route %q requires provider/backend_model or targets", route.ExternalModel)
+				return fmt.Errorf("model route %q requires provider/backend_model or targets", route.ExternalModel)
 			}
 			route.Targets = []Target{{
 				Provider:            route.Provider,
@@ -134,23 +162,41 @@ func Load(path string) (*Config, error) {
 			target.BackendModel = strings.TrimSpace(target.BackendModel)
 			target.IgnoreRequestFields = normalizeRequestFields(target.IgnoreRequestFields)
 			if target.Provider == "" {
-				return nil, fmt.Errorf("model route %q target[%d] provider is required", route.ExternalModel, j)
+				return fmt.Errorf("model route %q target[%d] provider is required", route.ExternalModel, j)
 			}
 			if target.BackendModel == "" {
-				return nil, fmt.Errorf("model route %q target[%d] backend_model is required", route.ExternalModel, j)
+				return fmt.Errorf("model route %q target[%d] backend_model is required", route.ExternalModel, j)
 			}
+		}
+	}
+
+	for i := range cfg.Pricing {
+		rule := &cfg.Pricing[i]
+		rule.Provider = strings.TrimSpace(rule.Provider)
+		rule.BackendModel = strings.TrimSpace(rule.BackendModel)
+		rule.Scheme = strings.ToLower(strings.TrimSpace(rule.Scheme))
+		if rule.Provider == "" {
+			return fmt.Errorf("config.pricing[%d].provider is required", i)
+		}
+		if _, ok := providerNames[rule.Provider]; !ok {
+			return fmt.Errorf("config.pricing[%d].provider %q is not defined", i, rule.Provider)
+		}
+		if rule.BackendModel == "" {
+			return fmt.Errorf("config.pricing[%d].backend_model is required", i)
+		}
+		if rule.Scheme == "" {
+			rule.Scheme = "generic"
 		}
 	}
 
 	externalModels := make(map[string]struct{}, len(cfg.ModelRoutes))
 	for _, route := range cfg.ModelRoutes {
 		if _, exists := externalModels[route.ExternalModel]; exists {
-			return nil, fmt.Errorf("duplicate model route %q", route.ExternalModel)
+			return fmt.Errorf("duplicate model route %q", route.ExternalModel)
 		}
 		externalModels[route.ExternalModel] = struct{}{}
 	}
-
-	return &cfg, nil
+	return nil
 }
 
 func normalizeRequestFields(fields []string) []string {
@@ -171,6 +217,23 @@ func normalizeRequestFields(fields []string) []string {
 		out = append(out, field)
 	}
 	return out
+}
+
+func parseEnvReference(value string) (string, bool) {
+	if !strings.HasPrefix(value, "${") || !strings.HasSuffix(value, "}") {
+		return "", false
+	}
+	name := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(value, "${"), "}"))
+	if name == "" {
+		return "", false
+	}
+	for _, r := range name {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return "", false
+	}
+	return name, true
 }
 
 // LoadEnv loads the process .env file before any other config resolution.

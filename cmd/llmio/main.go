@@ -21,9 +21,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	configPath := os.Getenv("LLMIO_CONFIG")
-	if configPath == "" {
-		configPath = "llmio.json"
+	databasePath := os.Getenv("LLMIO_DATABASE_PATH")
+	if databasePath == "" {
+		databasePath = "llmio.db"
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
@@ -31,9 +31,9 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	application, err := app.Bootstrap(configPath)
+	application, err := app.Bootstrap(databasePath)
 	if err != nil {
-		slog.Error("bootstrap app", "path", configPath, "err", err)
+		slog.Error("bootstrap app", "database_path", databasePath, "err", err)
 		os.Exit(1)
 	}
 

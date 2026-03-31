@@ -70,3 +70,32 @@ func TestNewAdapter(t *testing.T) {
 		})
 	}
 }
+
+func TestNewAdapterResolvesProviderAPIKeyEnvReference(t *testing.T) {
+	t.Setenv("TEST_PROVIDER_KEY", "from-env")
+
+	adapter, err := NewAdapter(config.ProviderConfig{
+		Name:    "openai",
+		Type:    "openai-compatible",
+		BaseURL: "https://example.com/v1",
+		APIKey:  "${TEST_PROVIDER_KEY}",
+	})
+	if err != nil {
+		t.Fatalf("NewAdapter() error = %v", err)
+	}
+	if _, ok := adapter.(*openaiprovider.OpenAICompatible); !ok {
+		t.Fatalf("adapter type = %T", adapter)
+	}
+}
+
+func TestNewAdapterRejectsInvalidProviderAPIKeyReference(t *testing.T) {
+	_, err := NewAdapter(config.ProviderConfig{
+		Name:    "openai",
+		Type:    "openai-compatible",
+		BaseURL: "https://example.com/v1",
+		APIKey:  "prefix-${TEST_PROVIDER_KEY}",
+	})
+	if err == nil || err.Error() != `provider "openai" api_key must be plaintext or ${ENV_NAME}` {
+		t.Fatalf("error = %v", err)
+	}
+}

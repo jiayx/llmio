@@ -11,12 +11,17 @@ import (
 
 // NewAdapter constructs a provider adapter from config.
 func NewAdapter(cfg config.ProviderConfig) (providerapi.ProviderAdapter, error) {
-	switch cfg.Type {
+	resolved, err := config.ResolveProviderConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	switch resolved.Type {
 	case "openai-compatible":
-		return openaiprovider.NewOpenAICompatible(cfg), nil
+		return openaiprovider.NewOpenAICompatible(resolved), nil
 	case "anthropic-native":
-		return anthropicprovider.NewAnthropicNative(cfg), nil
+		return anthropicprovider.NewAnthropicNative(resolved), nil
 	default:
-		return nil, fmt.Errorf("unsupported provider type %q", cfg.Type)
+		return nil, fmt.Errorf("unsupported provider type %q", resolved.Type)
 	}
 }

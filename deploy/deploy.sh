@@ -30,6 +30,7 @@ VERSION="${VERSION:-$(git -C "$ROOT_DIR" rev-parse --short HEAD)}"
 
 REMOTE_APP_DIR="/opt/llmio"
 REMOTE_CONFIG_DIR="/etc/llmio"
+REMOTE_DATA_DIR="/var/lib/llmio"
 REMOTE_ENV_FILE="$REMOTE_CONFIG_DIR/llmio.env"
 REMOTE_SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 REMOTE_RUN_USER="llmio"
@@ -92,7 +93,7 @@ package_release() {
 
   cp "$DEPLOY_DIR/llmio.service" "$PKG_ROOT/llmio.service"
   cp "$DEPLOY_DIR/llmio.env.example" "$PKG_ROOT/llmio.env.example"
-  cp "$ROOT_DIR/llmio.json.example" "$PKG_ROOT/llmio.json.example"
+  cp "$ROOT_DIR/runtime-config.json.example" "$PKG_ROOT/runtime-config.json.example"
 
   mkdir -p "$DIST_DIR"
   tar -C "$BUILD_DIR" -czf "$ARCHIVE_PATH" "$PKG_NAME"
@@ -122,6 +123,7 @@ SERVICE_NAME='$SERVICE_NAME' \
 VERSION='$VERSION' \
 REMOTE_APP_DIR='$REMOTE_APP_DIR' \
 REMOTE_CONFIG_DIR='$REMOTE_CONFIG_DIR' \
+REMOTE_DATA_DIR='$REMOTE_DATA_DIR' \
 REMOTE_ENV_FILE='$REMOTE_ENV_FILE' \
 REMOTE_SERVICE_PATH='$REMOTE_SERVICE_PATH' \
 REMOTE_RUN_USER='$REMOTE_RUN_USER' \
@@ -134,7 +136,7 @@ RELEASES_DIR="$REMOTE_APP_DIR/releases"
 RELEASE_DIR="$RELEASES_DIR/$VERSION"
 CURRENT_LINK="$REMOTE_APP_DIR/current"
 
-mkdir -p "$RELEASES_DIR" "$REMOTE_CONFIG_DIR"
+mkdir -p "$RELEASES_DIR" "$REMOTE_CONFIG_DIR" "$REMOTE_DATA_DIR"
 
 if ! getent group "$REMOTE_RUN_GROUP" >/dev/null 2>&1; then
   groupadd --system "$REMOTE_RUN_GROUP"
@@ -151,13 +153,13 @@ chmod +x "$RELEASE_DIR/$APP_NAME"
 if [[ ! -f "$REMOTE_ENV_FILE" ]]; then
   cp "$RELEASE_DIR/llmio.env.example" "$REMOTE_ENV_FILE"
 fi
-if [[ ! -f "$REMOTE_CONFIG_DIR/llmio.json" ]]; then
-  cp "$RELEASE_DIR/llmio.json.example" "$REMOTE_CONFIG_DIR/llmio.json"
+if [[ ! -f "$REMOTE_CONFIG_DIR/runtime-config.json.example" ]]; then
+  cp "$RELEASE_DIR/runtime-config.json.example" "$REMOTE_CONFIG_DIR/runtime-config.json.example"
 fi
 
 install -m 0644 "$RELEASE_DIR/llmio.service" "$REMOTE_SERVICE_PATH"
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
-chown -R "$REMOTE_RUN_USER:$REMOTE_RUN_GROUP" "$REMOTE_APP_DIR" "$REMOTE_CONFIG_DIR"
+chown -R "$REMOTE_RUN_USER:$REMOTE_RUN_GROUP" "$REMOTE_APP_DIR" "$REMOTE_CONFIG_DIR" "$REMOTE_DATA_DIR"
 
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
