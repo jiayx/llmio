@@ -138,9 +138,6 @@ func DefaultAdapters() []ProtocolAdapter {
 
 // LookupEndpoint resolves an inbound path to the owning adapter and endpoint metadata.
 func LookupEndpoint(adapters []ProtocolAdapter, path string) (ProtocolAdapter, Endpoint, bool) {
-	if len(adapters) == 0 {
-		adapters = DefaultAdapters()
-	}
 	for _, adapter := range adapters {
 		if endpoint, ok := adapter.Match(path); ok {
 			return adapter, endpoint, true

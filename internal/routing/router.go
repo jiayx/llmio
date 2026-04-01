@@ -32,15 +32,23 @@ type Router struct {
 	routes map[string]Route
 }
 
-// New constructs a static router from config.
-func New(cfg *config.Config, adapters map[string]providerapi.ProviderAdapter) (*Router, error) {
-	r := &Router{routes: make(map[string]Route, len(cfg.ModelRoutes))}
+// New constructs a static router from runtime config.
+func New(cfg *config.RuntimeConfig, adapters map[string]providerapi.ProviderAdapter) (*Router, error) {
+	r := &Router{routes: make(map[string]Route, len(cfg.Models))}
+	targetsByName := make(map[string]config.TargetConfig, len(cfg.Targets))
+	for _, target := range cfg.Targets {
+		targetsByName[target.Name] = target
+	}
 
-	for _, route := range cfg.ModelRoutes {
-		targets := make([]Target, 0, len(route.Targets))
-		for _, target := range route.Targets {
+	for _, model := range cfg.Models {
+		targets := make([]Target, 0, len(model.Targets))
+		for _, targetName := range model.Targets {
+			target, ok := targetsByName[targetName]
+			if !ok {
+				return nil, fmt.Errorf("model %q references unknown target %q", model.Name, targetName)
+			}
 			if _, ok := adapters[target.Provider]; !ok {
-				return nil, fmt.Errorf("model route %q references unknown provider %q", route.ExternalModel, target.Provider)
+				return nil, fmt.Errorf("target %q references unknown provider %q", target.Name, target.Provider)
 			}
 			targets = append(targets, Target{
 				ProviderName:        target.Provider,
@@ -48,8 +56,8 @@ func New(cfg *config.Config, adapters map[string]providerapi.ProviderAdapter) (*
 				IgnoreRequestFields: append([]string(nil), target.IgnoreRequestFields...),
 			})
 		}
-		r.routes[route.ExternalModel] = Route{
-			ExternalModel: route.ExternalModel,
+		r.routes[model.Name] = Route{
+			ExternalModel: model.Name,
 			Targets:       targets,
 		}
 	}
@@ -59,19 +67,12 @@ func New(cfg *config.Config, adapters map[string]providerapi.ProviderAdapter) (*
 
 // Resolve returns the configured route for an external model.
 func (r *Router) Resolve(externalModel string) (Route, bool) {
-	if r == nil {
-		return Route{}, false
-	}
 	route, ok := r.routes[externalModel]
 	return route, ok
 }
 
 // ModelInfos returns models in stable order for `/v1/models`.
 func (r *Router) ModelInfos() []ModelInfo {
-	if r == nil {
-		return nil
-	}
-
 	keys := make([]string, 0, len(r.routes))
 	for model := range r.routes {
 		keys = append(keys, model)

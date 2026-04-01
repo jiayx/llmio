@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/jiayx/llmio/internal/apikeys"
+	"github.com/jiayx/llmio/internal/authctx"
 	"github.com/jiayx/llmio/internal/billing"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
@@ -24,60 +25,98 @@ import (
 	"github.com/jiayx/llmio/internal/providers"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
-	"github.com/jiayx/llmio/internal/runtimeconfig"
-	"github.com/jiayx/llmio/internal/usage"
+	storagesqlite "github.com/jiayx/llmio/internal/storage/sqlite"
 )
 
 type chatProvider = providerapi.ProviderAdapter
 type routeTarget = routing.Target
 type modelRoute = routing.Route
 
+// RuntimeConfigStatus describes whether runtime config is usable for request handling.
+type RuntimeConfigStatus string
+
+const (
+	RuntimeConfigStatusMissing RuntimeConfigStatus = "missing"
+	RuntimeConfigStatusInvalid RuntimeConfigStatus = "invalid"
+	RuntimeConfigStatusReady   RuntimeConfigStatus = "ready"
+)
+
+// RuntimeConfigState captures the current runtime config document and readiness state.
+type RuntimeConfigState struct {
+	Status RuntimeConfigStatus
+	Config config.RuntimeConfig
+	Error  string
+}
+
 type runtimeSnapshot struct {
+	status RuntimeConfigStatus
+	config config.RuntimeConfig
+	err    string
 	router *routing.Router
 	policy *policy.Policy
 }
 
 // Server routes compatible OpenAI and Anthropic requests to configured providers.
 type Server struct {
-	adminAPIKeys     map[string]apikeys.Principal
-	apiKeyStore      *apikeys.Store
-	runtimeStore     *runtimeconfig.Store
+	adminAPIKeys     map[string]authctx.Principal
+	apiKeyStore      *storagesqlite.APIKeyStore
+	runtimeStore     *storagesqlite.RuntimeConfigStore
+	db               *sql.DB
 	snapshot         atomic.Pointer[runtimeSnapshot]
 	protocolAdapters []protocols.ProtocolAdapter
 }
 
-// NewServer constructs a gateway server from config.
-func NewServer(cfg *config.Config) (*Server, error) {
+// MissingRuntimeConfigState marks the gateway as started without any persisted runtime config.
+func MissingRuntimeConfigState() RuntimeConfigState {
+	return RuntimeConfigState{Status: RuntimeConfigStatusMissing}
+}
+
+// InvalidRuntimeConfigState marks the gateway as started with a persisted but unusable runtime config.
+func InvalidRuntimeConfigState(doc config.RuntimeConfig, err error) RuntimeConfigState {
+	state := RuntimeConfigState{
+		Status: RuntimeConfigStatusInvalid,
+		Config: doc,
+	}
+	if err != nil {
+		state.Error = err.Error()
+	}
+	return state
+}
+
+// ReadyRuntimeConfigState marks the gateway as ready to route requests with the given config.
+func ReadyRuntimeConfigState(doc config.RuntimeConfig) RuntimeConfigState {
+	return RuntimeConfigState{
+		Status: RuntimeConfigStatusReady,
+		Config: doc,
+	}
+}
+
+// NewServer constructs a gateway server from startup config, runtime config state, and shared storage.
+func NewServer(appCfg *config.AppConfig, runtimeState RuntimeConfigState, db *sql.DB) (*Server, error) {
+	if appCfg == nil {
+		return nil, fmt.Errorf("app config is required")
+	}
+	if db == nil {
+		return nil, fmt.Errorf("db is required")
+	}
 	s := &Server{
-		adminAPIKeys:     make(map[string]apikeys.Principal, len(cfg.AdminAPIKeys)),
+		adminAPIKeys:     make(map[string]authctx.Principal, len(appCfg.AdminAPIKeys)),
+		db:               db,
 		protocolAdapters: protocols.DefaultAdapters(),
 	}
 
-	for _, key := range cfg.AdminAPIKeys {
+	for _, key := range appCfg.AdminAPIKeys {
 		if key != "" {
-			s.adminAPIKeys[key] = apikeys.Principal{
+			s.adminAPIKeys[key] = authctx.Principal{
 				ID:   "admin:" + maskAPIKey(key),
 				Name: "admin",
 			}
 		}
 	}
 
-	store, err := apikeys.Open(cfg.DatabasePath)
-	if err != nil {
-		return nil, err
-	}
-	s.apiKeyStore = store
-
-	runtimeStore, err := runtimeconfig.Open(cfg.DatabasePath)
-	if err != nil {
-		return nil, err
-	}
-	s.runtimeStore = runtimeStore
-	if err := s.applyRuntimeConfig(config.RuntimeConfig{
-		Providers:   cfg.Providers,
-		ModelRoutes: cfg.ModelRoutes,
-		Pricing:     cfg.Pricing,
-	}); err != nil {
+	s.apiKeyStore = storagesqlite.NewAPIKeyStore(db)
+	s.runtimeStore = storagesqlite.NewRuntimeConfigStore(db)
+	if err := s.applyRuntimeState(runtimeState); err != nil {
 		return nil, err
 	}
 
@@ -88,6 +127,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/admin/usage", s.handleAdminUsage)
 	mux.HandleFunc("/admin/api-keys", s.handleAdminAPIKeys)
 	mux.HandleFunc("/admin/api-keys/", s.handleAdminAPIKeyByID)
@@ -98,7 +138,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -113,34 +153,27 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				writeUnauthorized(w, r.URL.Path)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(apikeys.WithPrincipal(r.Context(), principal)))
+			next.ServeHTTP(w, r.WithContext(authctx.WithPrincipal(r.Context(), principal)))
 			return
 		}
 
 		principal, ok := s.authenticateLLMKey(key)
 		if !ok {
-			if len(s.adminAPIKeys) == 0 && (s.apiKeyStore == nil || len(s.apiKeyStore.List()) == 0) {
-				next.ServeHTTP(w, r)
-				return
-			}
 			writeUnauthorized(w, r.URL.Path)
 			return
 		}
-		if principal.Managed && s.apiKeyStore != nil && s.apiKeyStore.BudgetExceeded(principal.ID) {
+		if principal.Managed && s.apiKeyStore.BudgetExceeded(principal.ID) {
 			writeBudgetExceeded(w, r.URL.Path)
 			return
 		}
 
-		next.ServeHTTP(w, r.WithContext(apikeys.WithPrincipal(r.Context(), principal)))
+		next.ServeHTTP(w, r.WithContext(authctx.WithPrincipal(r.Context(), principal)))
 	})
 }
 
-func (s *Server) authenticateLLMKey(key string) (apikeys.Principal, bool) {
+func (s *Server) authenticateLLMKey(key string) (authctx.Principal, bool) {
 	if principal, ok := s.adminAPIKeys[key]; ok {
 		return principal, true
-	}
-	if s.apiKeyStore == nil {
-		return apikeys.Principal{}, false
 	}
 	return s.apiKeyStore.Authenticate(key)
 }
@@ -217,6 +250,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	snapshot := s.currentSnapshot()
+	status := snapshot.status
+	if status == RuntimeConfigStatusReady {
+		writeJSON(w, http.StatusOK, map[string]any{"status": status})
+		return
+	}
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"status": status,
+		"error":  runtimeUnavailableMessage(snapshot),
+	})
 }
 
 func (s *Server) handleAdminAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -321,35 +367,16 @@ func (s *Server) handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAdminRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		if s.runtimeStore == nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "runtime config store unavailable"})
-			return
-		}
-		doc, _, err := s.runtimeStore.Load()
-		if err != nil {
-			if os.IsNotExist(err) {
-				writeJSON(w, http.StatusOK, config.RuntimeConfig{})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, doc)
+		writeJSON(w, http.StatusOK, s.runtimeConfigResponse())
 	case http.MethodPut:
-		if s.runtimeStore == nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "runtime config store unavailable"})
-			return
-		}
 		var doc config.RuntimeConfig
 		if err := json.NewDecoder(r.Body).Decode(&doc); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 			return
 		}
-		if len(doc.Providers) > 0 || len(doc.ModelRoutes) > 0 || len(doc.Pricing) > 0 {
-			if err := config.PrepareRuntimeConfig(&doc); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-				return
-			}
+		if err := config.PrepareRuntimeConfig(&doc); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
 		}
 		snapshot, err := s.buildRuntimeSnapshot(doc)
 		if err != nil {
@@ -361,7 +388,7 @@ func (s *Server) handleAdminRuntimeConfig(w http.ResponseWriter, r *http.Request
 			return
 		}
 		s.applyRuntimeSnapshot(snapshot)
-		writeJSON(w, http.StatusOK, doc)
+		writeJSON(w, http.StatusOK, s.runtimeConfigResponse())
 	default:
 		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -381,6 +408,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, "openai", http.MethodGet)
 		return
 	}
+	if !s.ensureRuntimeReady(w, r.URL.Path) {
+		return
+	}
 
 	protocolopenai.WriteModels(w, s.modelInfos())
 }
@@ -388,6 +418,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeMethodNotAllowed(w, "openai", http.MethodPost)
+		return
+	}
+	if !s.ensureRuntimeReady(w, r.URL.Path) {
 		return
 	}
 
@@ -458,6 +491,9 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, "openai", http.MethodPost)
 		return
 	}
+	if !s.ensureRuntimeReady(w, r.URL.Path) {
+		return
+	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -525,6 +561,9 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeMethodNotAllowed(w, "anthropic", http.MethodPost)
+		return
+	}
+	if !s.ensureRuntimeReady(w, r.URL.Path) {
 		return
 	}
 
@@ -623,11 +662,7 @@ func allowsMethod(method string, allowed ...string) bool {
 }
 
 func (s *Server) executionPolicy() *policy.Policy {
-	snapshot := s.currentSnapshot()
-	if snapshot.policy != nil {
-		return snapshot.policy
-	}
-	return policy.New(policy.DefaultConfig(), nil)
+	return s.currentSnapshot().policy
 }
 
 func (s *Server) resolveRoute(externalModel string) (modelRoute, bool) {
@@ -646,13 +681,30 @@ func (s *Server) modelInfos() []routing.ModelInfo {
 	return snapshot.router.ModelInfos()
 }
 
-func (s *Server) applyRuntimeConfig(doc config.RuntimeConfig) error {
-	snapshot, err := s.buildRuntimeSnapshot(doc)
-	if err != nil {
-		return err
+func (s *Server) applyRuntimeState(state RuntimeConfigState) error {
+	switch state.Status {
+	case RuntimeConfigStatusMissing:
+		s.applyRuntimeSnapshot(&runtimeSnapshot{
+			status: RuntimeConfigStatusMissing,
+		})
+		return nil
+	case RuntimeConfigStatusInvalid:
+		s.applyRuntimeSnapshot(&runtimeSnapshot{
+			status: RuntimeConfigStatusInvalid,
+			config: state.Config,
+			err:    state.Error,
+		})
+		return nil
+	case RuntimeConfigStatusReady:
+		snapshot, err := s.buildRuntimeSnapshot(state.Config)
+		if err != nil {
+			return err
+		}
+		s.applyRuntimeSnapshot(snapshot)
+		return nil
+	default:
+		return fmt.Errorf("unsupported runtime config status %q", state.Status)
 	}
-	s.applyRuntimeSnapshot(snapshot)
-	return nil
 }
 
 func (s *Server) buildRuntimeSnapshot(doc config.RuntimeConfig) (*runtimeSnapshot, error) {
@@ -669,11 +721,12 @@ func (s *Server) buildRuntimeSnapshot(doc config.RuntimeConfig) (*runtimeSnapsho
 		router *routing.Router
 		err    error
 	)
-	if len(doc.ModelRoutes) > 0 {
-		router, err = routing.New(&config.Config{
-			Providers:   doc.Providers,
-			ModelRoutes: doc.ModelRoutes,
-			Pricing:     doc.Pricing,
+	if len(doc.Models) > 0 {
+		router, err = routing.New(&config.RuntimeConfig{
+			Providers: doc.Providers,
+			Targets:   doc.Targets,
+			Models:    doc.Models,
+			Pricing:   doc.Pricing,
 		}, providersMap)
 		if err != nil {
 			return nil, err
@@ -682,26 +735,69 @@ func (s *Server) buildRuntimeSnapshot(doc config.RuntimeConfig) (*runtimeSnapsho
 
 	execPolicy := policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
 		Catalog: billing.NewCatalog(doc.Pricing),
-		Next:    usage.SQLiteRecorder{DB: s.apiKeyStore.DB()},
+		Next:    storagesqlite.NewUsageStore(s.db),
 	})
 	return &runtimeSnapshot{
+		status: RuntimeConfigStatusReady,
+		config: doc,
 		router: router,
 		policy: execPolicy,
 	}, nil
 }
 
 func (s *Server) currentSnapshot() *runtimeSnapshot {
-	if snapshot := s.snapshot.Load(); snapshot != nil {
-		return snapshot
-	}
-	return &runtimeSnapshot{}
+	return s.snapshot.Load()
 }
 
 func (s *Server) applyRuntimeSnapshot(snapshot *runtimeSnapshot) {
-	if snapshot == nil {
+	s.snapshot.Store(snapshot)
+}
+
+func (s *Server) runtimeConfigResponse() map[string]any {
+	snapshot := s.currentSnapshot()
+	payload := map[string]any{
+		"status": snapshot.status,
+		"config": snapshot.config,
+	}
+	if snapshot.err != "" {
+		payload["error"] = snapshot.err
+	}
+	return payload
+}
+
+func (s *Server) ensureRuntimeReady(w http.ResponseWriter, path string) bool {
+	snapshot := s.currentSnapshot()
+	if snapshot.status == RuntimeConfigStatusReady {
+		return true
+	}
+	writeRuntimeUnavailable(w, path, runtimeUnavailableMessage(snapshot))
+	return false
+}
+
+func runtimeUnavailableMessage(snapshot *runtimeSnapshot) string {
+	switch snapshot.status {
+	case RuntimeConfigStatusMissing:
+		return "runtime config is missing"
+	case RuntimeConfigStatusInvalid:
+		if snapshot.err != "" {
+			return "runtime config is invalid: " + snapshot.err
+		}
+		return "runtime config is invalid"
+	default:
+		return "runtime config is not ready"
+	}
+}
+
+func writeRuntimeUnavailable(w http.ResponseWriter, path, message string) {
+	if adapter, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok && adapter.Protocol() == protocols.ProtocolAnthropic {
+		protocolanthropic.WriteError(w, http.StatusServiceUnavailable, "api_error", message)
 		return
 	}
-	s.snapshot.Store(snapshot)
+	if _, _, ok := protocols.LookupEndpoint(protocols.DefaultAdapters(), path); ok {
+		protocolopenai.WriteError(w, http.StatusServiceUnavailable, message)
+		return
+	}
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": message})
 }
 
 func routeTargetsForLog(route modelRoute) []string {
@@ -716,7 +812,7 @@ func routeTargetsForLog(route modelRoute) []string {
 }
 
 func (s *Server) registerProtocolRoutes(mux *http.ServeMux) {
-	for _, adapter := range s.protocolAdaptersOrDefault() {
+	for _, adapter := range s.protocolAdapters {
 		for _, endpoint := range adapter.Endpoints() {
 			if handler := s.handlerForEndpoint(adapter.Protocol(), endpoint.APIType); handler != nil {
 				mux.HandleFunc(endpoint.InboundPath, handler)
@@ -740,25 +836,18 @@ func (s *Server) handlerForEndpoint(protocol, apiType string) http.HandlerFunc {
 	}
 }
 
-func (s *Server) protocolAdaptersOrDefault() []protocols.ProtocolAdapter {
-	if len(s.protocolAdapters) == 0 {
-		return protocols.DefaultAdapters()
-	}
-	return s.protocolAdapters
-}
-
 func (s *Server) protocolAdapterForPath(path string) (protocols.ProtocolAdapter, bool) {
-	adapter, _, ok := protocols.LookupEndpoint(s.protocolAdaptersOrDefault(), path)
+	adapter, _, ok := protocols.LookupEndpoint(s.protocolAdapters, path)
 	return adapter, ok
 }
 
 func (s *Server) protocolRequestMetaForPath(ctx context.Context, path, externalModel string, body []byte, headers http.Header, stream bool) (protocols.RequestMeta, error) {
-	adapter, endpoint, ok := protocols.LookupEndpoint(s.protocolAdaptersOrDefault(), path)
+	adapter, endpoint, ok := protocols.LookupEndpoint(s.protocolAdapters, path)
 	if !ok {
 		return protocols.RequestMeta{}, fmt.Errorf("unsupported client path %q", path)
 	}
 	meta := adapter.Request(endpoint, externalModel, body, headers, stream)
-	if principal, ok := apikeys.PrincipalFromContext(ctx); ok {
+	if principal, ok := authctx.PrincipalFromContext(ctx); ok {
 		meta.APIKeyID = principal.ID
 		meta.APIKeyName = principal.Name
 	}

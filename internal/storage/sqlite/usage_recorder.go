@@ -1,28 +1,31 @@
-package usage
+package sqlite
 
 import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/jiayx/llmio/internal/usage"
 )
 
-type sqlExecer interface {
-	Exec(query string, args ...any) (sql.Result, error)
+// UsageStore persists aggregated usage in SQLite.
+type UsageStore struct {
+	db *sql.DB
 }
 
-// SQLiteRecorder aggregates usage events into the shared api_key_usage table.
-type SQLiteRecorder struct {
-	DB sqlExecer
+// NewUsageStore constructs a usage store on top of the shared SQLite database.
+func NewUsageStore(db *sql.DB) *UsageStore {
+	return &UsageStore{db: db}
 }
 
 // Record stores usage under the authenticated managed API key.
-func (r SQLiteRecorder) Record(_ context.Context, event Event) {
-	if r.DB == nil || event.APIKeyID == "" {
+func (s *UsageStore) Record(_ context.Context, event usage.Event) {
+	if event.APIKeyID == "" {
 		return
 	}
 
 	lastUsedAt := event.Timestamp.UTC().Format(time.RFC3339Nano)
-	_, _ = r.DB.Exec(`
+	_, _ = s.db.Exec(`
 		UPDATE api_key_usage
 		SET
 			request_count = request_count + 1,

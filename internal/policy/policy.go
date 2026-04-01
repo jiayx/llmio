@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiayx/llmio/internal/apikeys"
+	"github.com/jiayx/llmio/internal/authctx"
 	"github.com/jiayx/llmio/internal/llm"
 	"github.com/jiayx/llmio/internal/observability"
 	protocols "github.com/jiayx/llmio/internal/protocols"
@@ -432,7 +432,7 @@ func (p *Policy) recordUsage(ctx context.Context, target routing.Target, externa
 		apiKeyID   string
 		apiKeyName string
 	)
-	if principal, ok := apikeys.PrincipalFromContext(ctx); ok {
+	if principal, ok := authctx.PrincipalFromContext(ctx); ok {
 		apiKeyID = principal.ID
 		apiKeyName = principal.Name
 	}

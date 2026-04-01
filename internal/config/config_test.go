@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-func TestPrepareExpandsAndNormalizesRuntimeConfig(t *testing.T) {
-	cfg := &Config{
+func TestPrepareRuntimeConfigExpandsAndNormalizes(t *testing.T) {
+	cfg := &RuntimeConfig{
 		Providers: []ProviderConfig{{
 			Name:              "p",
 			Type:              "openai-compatible",
@@ -15,20 +15,22 @@ func TestPrepareExpandsAndNormalizesRuntimeConfig(t *testing.T) {
 			APIKey:            os.ExpandEnv("${TEST_PROVIDER_KEY}"),
 			SupportedAPITypes: []string{" Responses ", "CHAT_COMPLETIONS", ""},
 		}},
-		ModelRoutes: []ModelRoute{{
-			ExternalModel: "m",
-			Targets: []Target{{
-				Provider:            "p",
-				BackendModel:        "backend",
-				IgnoreRequestFields: []string{" Temperature ", "temperature", "MAX_OUTPUT_TOKENS", ""},
-			}},
+		Targets: []TargetConfig{{
+			Name:                "t",
+			Provider:            "p",
+			BackendModel:        "backend",
+			IgnoreRequestFields: []string{" Temperature ", "temperature", "MAX_OUTPUT_TOKENS", ""},
+		}},
+		Models: []ModelConfig{{
+			Name:    "m",
+			Targets: []string{"t"},
 		}},
 	}
 	t.Setenv("TEST_PROVIDER_KEY", "from-env")
 	cfg.Providers[0].APIKey = os.ExpandEnv("${TEST_PROVIDER_KEY}")
 
-	if err := Prepare(cfg, t.TempDir()); err != nil {
-		t.Fatalf("Prepare() error = %v", err)
+	if err := PrepareRuntimeConfig(cfg); err != nil {
+		t.Fatalf("PrepareRuntimeConfig() error = %v", err)
 	}
 	if got := cfg.Providers[0].APIKey; got != "from-env" {
 		t.Fatalf("api_key = %q", got)
@@ -39,58 +41,48 @@ func TestPrepareExpandsAndNormalizesRuntimeConfig(t *testing.T) {
 	if got := cfg.Providers[0].SupportedAPITypes; len(got) != 2 || got[0] != "responses" || got[1] != "chat_completions" {
 		t.Fatalf("supported_api_types = %#v", got)
 	}
-	if got := cfg.ModelRoutes[0].Targets[0].IgnoreRequestFields; len(got) != 2 || got[0] != "temperature" || got[1] != "max_output_tokens" {
+	if got := cfg.Targets[0].IgnoreRequestFields; len(got) != 2 || got[0] != "temperature" || got[1] != "max_output_tokens" {
 		t.Fatalf("ignore_request_fields = %#v", got)
 	}
 }
 
-func TestPrepareRejectsDuplicateProviders(t *testing.T) {
-	cfg := &Config{
+func TestPrepareRuntimeConfigRejectsDuplicateProviders(t *testing.T) {
+	cfg := &RuntimeConfig{
 		Providers: []ProviderConfig{
 			{Name: "p", Type: "openai-compatible", BaseURL: "https://example.com/v1"},
 			{Name: "p", Type: "anthropic-native", BaseURL: "https://api.anthropic.com/v1"},
 		},
-		ModelRoutes: []ModelRoute{{
-			ExternalModel: "m",
-			Targets:       []Target{{Provider: "p", BackendModel: "backend"}},
+		Targets: []TargetConfig{{
+			Name:         "t",
+			Provider:     "p",
+			BackendModel: "backend",
+		}},
+		Models: []ModelConfig{{
+			Name:    "m",
+			Targets: []string{"t"},
 		}},
 	}
 
-	if err := Prepare(cfg, t.TempDir()); err == nil || err.Error() != `duplicate provider "p"` {
+	if err := PrepareRuntimeConfig(cfg); err == nil || err.Error() != `duplicate provider "p"` {
 		t.Fatalf("error = %v", err)
 	}
 }
 
-func TestPrepareRejectsDuplicateModelRoutes(t *testing.T) {
-	cfg := &Config{
+func TestPrepareRuntimeConfigRejectsDuplicateModels(t *testing.T) {
+	cfg := &RuntimeConfig{
 		Providers: []ProviderConfig{{Name: "p", Type: "openai-compatible", BaseURL: "https://example.com/v1"}},
-		ModelRoutes: []ModelRoute{
-			{ExternalModel: "m", Targets: []Target{{Provider: "p", BackendModel: "backend-a"}}},
-			{ExternalModel: "m", Targets: []Target{{Provider: "p", BackendModel: "backend-b"}}},
+		Targets: []TargetConfig{
+			{Name: "t1", Provider: "p", BackendModel: "backend-a"},
+			{Name: "t2", Provider: "p", BackendModel: "backend-b"},
+		},
+		Models: []ModelConfig{
+			{Name: "m", Targets: []string{"t1"}},
+			{Name: "m", Targets: []string{"t2"}},
 		},
 	}
 
-	if err := Prepare(cfg, t.TempDir()); err == nil || err.Error() != `duplicate model route "m"` {
+	if err := PrepareRuntimeConfig(cfg); err == nil || err.Error() != `duplicate model "m"` {
 		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestPrepareDefaultsDatabasePathAndAdminAPIKeys(t *testing.T) {
-	baseDir := t.TempDir()
-	cfg := &Config{
-		AdminAPIKeys: []string{"admin-1", " admin-2 "},
-		Providers:    []ProviderConfig{{Name: "p", Type: "openai-compatible", BaseURL: "https://example.com/v1"}},
-		ModelRoutes:  []ModelRoute{{ExternalModel: "m", Targets: []Target{{Provider: "p", BackendModel: "backend"}}}},
-	}
-
-	if err := Prepare(cfg, baseDir); err != nil {
-		t.Fatalf("Prepare() error = %v", err)
-	}
-	if len(cfg.AdminAPIKeys) != 2 || cfg.AdminAPIKeys[0] != "admin-1" || cfg.AdminAPIKeys[1] != "admin-2" {
-		t.Fatalf("admin_api_keys = %#v", cfg.AdminAPIKeys)
-	}
-	if cfg.DatabasePath != filepath.Join(baseDir, "llmio.db") {
-		t.Fatalf("database_path = %q", cfg.DatabasePath)
 	}
 }
 

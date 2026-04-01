@@ -3,25 +3,22 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// Config is the top-level gateway configuration loaded from disk.
-type Config struct {
-	Listen       string           `json:"listen"`
-	AdminAPIKeys []string         `json:"admin_api_keys"`
-	DatabasePath string           `json:"database_path"`
-	Providers    []ProviderConfig `json:"providers"`
-	Pricing      []PricingRule    `json:"pricing,omitempty"`
-	ModelRoutes  []ModelRoute     `json:"model_routes"`
+// AppConfig contains process startup settings that are not hot-reloaded.
+type AppConfig struct {
+	Listen       string   `json:"listen"`
+	AdminAPIKeys []string `json:"admin_api_keys"`
+	DatabasePath string   `json:"database_path"`
 }
 
 type RuntimeConfig struct {
-	Providers   []ProviderConfig `json:"providers"`
-	Pricing     []PricingRule    `json:"pricing,omitempty"`
-	ModelRoutes []ModelRoute     `json:"model_routes"`
+	Providers []ProviderConfig `json:"providers"`
+	Targets   []TargetConfig   `json:"targets,omitempty"`
+	Pricing   []PricingRule    `json:"pricing,omitempty"`
+	Models    []ModelConfig    `json:"models,omitempty"`
 }
 
 type PricingRule struct {
@@ -46,17 +43,18 @@ type ProviderConfig struct {
 	SupportedAPITypes []string          `json:"supported_api_types"`
 }
 
-// ModelRoute maps one external model name to one or more backend targets.
-type ModelRoute struct {
-	ExternalModel string   `json:"external_model"`
-	Targets       []Target `json:"targets"`
-}
-
-// Target defines a single backend provider/model pair for routing.
-type Target struct {
+// TargetConfig defines one named backend target bound to a provider and backend model.
+type TargetConfig struct {
+	Name                string   `json:"name"`
 	Provider            string   `json:"provider"`
 	BackendModel        string   `json:"backend_model"`
 	IgnoreRequestFields []string `json:"ignore_request_fields,omitempty"`
+}
+
+// ModelConfig maps one external model name to one or more named backend targets.
+type ModelConfig struct {
+	Name    string   `json:"name"`
+	Targets []string `json:"targets"`
 }
 
 func ResolveProviderConfig(cfg ProviderConfig) (ProviderConfig, error) {
@@ -80,61 +78,18 @@ func ResolveProviderConfig(cfg ProviderConfig) (ProviderConfig, error) {
 	return cfg, nil
 }
 
-func Prepare(cfg *Config, baseDir string) error {
-	if cfg == nil {
-		return fmt.Errorf("config is required")
-	}
-	if err := PrepareRuntimeConfig(&RuntimeConfig{
-		Providers:   cfg.Providers,
-		Pricing:     cfg.Pricing,
-		ModelRoutes: cfg.ModelRoutes,
-	}); err != nil {
-		return err
-	}
-
-	for i := range cfg.AdminAPIKeys {
-		cfg.AdminAPIKeys[i] = strings.TrimSpace(cfg.AdminAPIKeys[i])
-	}
-	cfg.DatabasePath = strings.TrimSpace(cfg.DatabasePath)
-	if cfg.DatabasePath == "" {
-		cfg.DatabasePath = filepath.Join(baseDir, "llmio.db")
-	} else if !filepath.IsAbs(cfg.DatabasePath) {
-		cfg.DatabasePath = filepath.Join(baseDir, cfg.DatabasePath)
-	}
-
-	return nil
-}
-
-func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
+func normalizeRuntimeConfig(cfg *RuntimeConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("runtime config is required")
 	}
-	if len(cfg.Providers) == 0 {
-		return fmt.Errorf("config.providers is required")
-	}
-	if len(cfg.ModelRoutes) == 0 {
-		return fmt.Errorf("config.model_routes is required")
-	}
-
-	providerNames := make(map[string]struct{}, len(cfg.Providers))
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
 		p.Name = strings.TrimSpace(p.Name)
-		if p.Name == "" {
-			return fmt.Errorf("config.providers[%d].name is required", i)
-		}
-		if _, exists := providerNames[p.Name]; exists {
-			return fmt.Errorf("duplicate provider %q", p.Name)
-		}
-		providerNames[p.Name] = struct{}{}
 		p.Type = strings.ToLower(strings.TrimSpace(p.Type))
 		if p.Type == "" {
 			p.Type = "openai-compatible"
 		}
 		p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
-		if p.BaseURL == "" {
-			return fmt.Errorf("provider %q base_url is required", p.Name)
-		}
 		if p.ModelsPath == "" {
 			p.ModelsPath = "/models"
 		}
@@ -149,26 +104,19 @@ func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
 		p.SupportedAPITypes = apiTypes
 	}
 
-	for i := range cfg.ModelRoutes {
-		route := &cfg.ModelRoutes[i]
-		route.ExternalModel = strings.TrimSpace(route.ExternalModel)
-		if route.ExternalModel == "" {
-			return fmt.Errorf("config.model_routes[%d].external_model is required", i)
-		}
-		if len(route.Targets) == 0 {
-			return fmt.Errorf("model route %q requires at least one target", route.ExternalModel)
-		}
-		for j := range route.Targets {
-			target := &route.Targets[j]
-			target.Provider = strings.TrimSpace(target.Provider)
-			target.BackendModel = strings.TrimSpace(target.BackendModel)
-			target.IgnoreRequestFields = normalizeRequestFields(target.IgnoreRequestFields)
-			if target.Provider == "" {
-				return fmt.Errorf("model route %q target[%d] provider is required", route.ExternalModel, j)
-			}
-			if target.BackendModel == "" {
-				return fmt.Errorf("model route %q target[%d] backend_model is required", route.ExternalModel, j)
-			}
+	for i := range cfg.Targets {
+		target := &cfg.Targets[i]
+		target.Name = strings.TrimSpace(target.Name)
+		target.Provider = strings.TrimSpace(target.Provider)
+		target.BackendModel = strings.TrimSpace(target.BackendModel)
+		target.IgnoreRequestFields = normalizeRequestFields(target.IgnoreRequestFields)
+	}
+
+	for i := range cfg.Models {
+		model := &cfg.Models[i]
+		model.Name = strings.TrimSpace(model.Name)
+		for j := range model.Targets {
+			model.Targets[j] = strings.TrimSpace(model.Targets[j])
 		}
 	}
 
@@ -177,6 +125,89 @@ func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
 		rule.Provider = strings.TrimSpace(rule.Provider)
 		rule.BackendModel = strings.TrimSpace(rule.BackendModel)
 		rule.Scheme = strings.ToLower(strings.TrimSpace(rule.Scheme))
+		if rule.Scheme == "" {
+			rule.Scheme = "generic"
+		}
+	}
+
+	return nil
+}
+
+func validateRuntimeConfig(cfg *RuntimeConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("runtime config is required")
+	}
+	if len(cfg.Providers) == 0 {
+		return fmt.Errorf("config.providers is required")
+	}
+	if len(cfg.Targets) == 0 {
+		return fmt.Errorf("config.targets is required")
+	}
+	if len(cfg.Models) == 0 {
+		return fmt.Errorf("config.models is required")
+	}
+
+	providerNames := make(map[string]struct{}, len(cfg.Providers))
+	for i := range cfg.Providers {
+		p := &cfg.Providers[i]
+		if p.Name == "" {
+			return fmt.Errorf("config.providers[%d].name is required", i)
+		}
+		if _, exists := providerNames[p.Name]; exists {
+			return fmt.Errorf("duplicate provider %q", p.Name)
+		}
+		providerNames[p.Name] = struct{}{}
+		if p.BaseURL == "" {
+			return fmt.Errorf("provider %q base_url is required", p.Name)
+		}
+	}
+
+	targetNames := make(map[string]struct{}, len(cfg.Targets))
+	for i := range cfg.Targets {
+		target := &cfg.Targets[i]
+		if target.Name == "" {
+			return fmt.Errorf("config.targets[%d].name is required", i)
+		}
+		if _, exists := targetNames[target.Name]; exists {
+			return fmt.Errorf("duplicate target %q", target.Name)
+		}
+		targetNames[target.Name] = struct{}{}
+		if target.Provider == "" {
+			return fmt.Errorf("config.targets[%d].provider is required", i)
+		}
+		if _, ok := providerNames[target.Provider]; !ok {
+			return fmt.Errorf("config.targets[%d].provider %q is not defined", i, target.Provider)
+		}
+		if target.BackendModel == "" {
+			return fmt.Errorf("config.targets[%d].backend_model is required", i)
+		}
+	}
+
+	modelNames := make(map[string]struct{}, len(cfg.Models))
+	for i := range cfg.Models {
+		model := &cfg.Models[i]
+		if model.Name == "" {
+			return fmt.Errorf("config.models[%d].name is required", i)
+		}
+		if _, exists := modelNames[model.Name]; exists {
+			return fmt.Errorf("duplicate model %q", model.Name)
+		}
+		modelNames[model.Name] = struct{}{}
+		if len(model.Targets) == 0 {
+			return fmt.Errorf("model %q requires at least one target", model.Name)
+		}
+		for j := range model.Targets {
+			if model.Targets[j] == "" {
+				return fmt.Errorf("model %q target[%d] is required", model.Name, j)
+			}
+			if _, ok := targetNames[model.Targets[j]]; !ok {
+				return fmt.Errorf("model %q references unknown target %q", model.Name, model.Targets[j])
+			}
+		}
+	}
+
+	for i := range cfg.Pricing {
+		rule := &cfg.Pricing[i]
 		if rule.Provider == "" {
 			return fmt.Errorf("config.pricing[%d].provider is required", i)
 		}
@@ -186,19 +217,19 @@ func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
 		if rule.BackendModel == "" {
 			return fmt.Errorf("config.pricing[%d].backend_model is required", i)
 		}
-		if rule.Scheme == "" {
-			rule.Scheme = "generic"
-		}
 	}
 
-	externalModels := make(map[string]struct{}, len(cfg.ModelRoutes))
-	for _, route := range cfg.ModelRoutes {
-		if _, exists := externalModels[route.ExternalModel]; exists {
-			return fmt.Errorf("duplicate model route %q", route.ExternalModel)
-		}
-		externalModels[route.ExternalModel] = struct{}{}
-	}
 	return nil
+}
+
+func PrepareRuntimeConfig(cfg *RuntimeConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("runtime config is required")
+	}
+	if err := normalizeRuntimeConfig(cfg); err != nil {
+		return err
+	}
+	return validateRuntimeConfig(cfg)
 }
 
 func normalizeRequestFields(fields []string) []string {

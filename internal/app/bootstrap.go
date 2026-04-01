@@ -1,54 +1,76 @@
 package app
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"strings"
 
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/gateway"
-	"github.com/jiayx/llmio/internal/runtimeconfig"
+	storagesqlite "github.com/jiayx/llmio/internal/storage/sqlite"
 )
 
 // Application wires config and gateway into a runnable server surface.
 type Application struct {
-	Config  *config.Config
+	Config  *config.AppConfig
 	Gateway *gateway.Server
 }
 
 // Bootstrap loads runtime config from SQLite and assembles the gateway service graph.
 func Bootstrap(databasePath string) (*Application, error) {
-	if strings.TrimSpace(databasePath) == "" {
+	databasePath = strings.TrimSpace(databasePath)
+	if databasePath == "" {
 		databasePath = os.Getenv("LLMIO_DATABASE_PATH")
 	}
-	if strings.TrimSpace(databasePath) == "" {
+	databasePath = strings.TrimSpace(databasePath)
+	if databasePath == "" {
 		databasePath = "llmio.db"
 	}
 
-	store, err := runtimeconfig.Open(databasePath)
+	db, err := storagesqlite.Open(databasePath)
 	if err != nil {
 		return nil, err
 	}
-	runtimeCfg, _, err := store.Load()
-	if err != nil && !os.IsNotExist(err) {
+	if err := storagesqlite.Init(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	cfg := &config.Config{
+	store := storagesqlite.NewRuntimeConfigStore(db)
+	runtimeCfg, _, err := store.Load()
+	runtimeState := gateway.MissingRuntimeConfigState()
+	var invalidErr *storagesqlite.InvalidRuntimeConfigError
+	switch {
+	case err == nil:
+		if prepareErr := config.PrepareRuntimeConfig(&runtimeCfg); prepareErr != nil {
+			runtimeState = gateway.InvalidRuntimeConfigState(runtimeCfg, prepareErr)
+		} else {
+			runtimeState = gateway.ReadyRuntimeConfigState(runtimeCfg)
+		}
+	case os.IsNotExist(err):
+		runtimeState = gateway.MissingRuntimeConfigState()
+	case errors.As(err, &invalidErr):
+		runtimeState = gateway.InvalidRuntimeConfigState(config.RuntimeConfig{}, err)
+	default:
+		_ = db.Close()
+		return nil, err
+	}
+	appCfg := &config.AppConfig{
 		Listen:       strings.TrimSpace(os.Getenv("LLMIO_LISTEN")),
 		AdminAPIKeys: splitCSV(os.Getenv("LLMIO_ADMIN_API_KEYS")),
 		DatabasePath: databasePath,
-		Providers:    runtimeCfg.Providers,
-		ModelRoutes:  runtimeCfg.ModelRoutes,
-		Pricing:      runtimeCfg.Pricing,
 	}
-
-	server, err := gateway.NewServer(cfg)
+	if appCfg.Listen == "" {
+		appCfg.Listen = ":18080"
+	}
+	server, err := gateway.NewServer(appCfg, runtimeState, db)
 	if err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
 	return &Application{
-		Config:  cfg,
+		Config:  appCfg,
 		Gateway: server,
 	}, nil
 }
@@ -75,10 +97,7 @@ func (a *Application) Handler() http.Handler {
 	return a.Gateway.Handler()
 }
 
-// ListenAddr returns the configured listen address with a sensible default.
+// ListenAddr returns the configured listen address.
 func (a *Application) ListenAddr() string {
-	if a == nil || a.Config == nil || a.Config.Listen == "" {
-		return ":18080"
-	}
 	return a.Config.Listen
 }

@@ -19,6 +19,18 @@
 
 这意味着目标不是“只支持 OpenAI-compatible 后端”，而是“任意客户端协议 -> 任意后端平台”。
 
+当前配置和存储边界是：
+
+- `AppConfig`：启动参数，例如 `listen`、`admin_api_keys`、`database_path`
+- `RuntimeConfig`：运行时路由配置，例如 `providers`、`targets`、`models`、`pricing`
+- `internal/storage/sqlite`：统一的 SQLite 打开、schema 初始化，以及 runtime config / API key / usage 的持久化实现
+
+runtime config 的运行状态有三种：
+
+- `missing`：数据库里还没有写入 runtime config，常见于首次启动
+- `invalid`：数据库里有 runtime config，但校验失败或无法解码
+- `ready`：runtime config 合法，网关可以正常处理推理请求
+
 ## 能力
 
 - 单一网关同时暴露 OpenAI 和 Anthropic 风格 endpoint
@@ -114,7 +126,7 @@ cp deploy/.env.example deploy/.env
 - `/etc/llmio/llmio.env`
 - `/etc/llmio/runtime-config.json.example`
 
-你需要先补齐 `/etc/llmio/llmio.env` 里的环境变量，再用 `/admin/runtime-config` 把 provider、pricing、model route 写进数据库。
+你需要先补齐 `/etc/llmio/llmio.env` 里的环境变量，再用 `/admin/runtime-config` 把 provider、pricing、targets、models 写进数据库。
 
 ## 配置
 
@@ -135,6 +147,34 @@ runtime config 通过 `GET /admin/runtime-config` 和 `PUT /admin/runtime-config
 - `LLMIO_LISTEN`：监听地址，默认 `:18080`
 - `LLMIO_ADMIN_API_KEYS`：管理员 API key，多个值用逗号分隔
 
+`/admin/runtime-config` 会在写入前对 runtime config 做规范化和校验。首次启动时如果数据库里还没有 runtime config，网关会以 `missing` 状态启动；如果数据库里的 runtime config 非法，网关会以 `invalid` 状态启动。两种情况下进程都可启动，管理接口仍可用，但推理请求会返回 `503`。
+
+健康检查接口：
+
+- `GET /healthz`：进程存活检查，只表示服务进程已启动
+- `GET /readyz`：运行就绪检查，只有 runtime config 处于 `ready` 才返回 `200`
+
+`GET /admin/runtime-config` 返回的不是裸配置对象，而是一个状态对象：
+
+```json
+{
+  "status": "ready",
+  "config": {
+    "providers": [],
+    "targets": [],
+    "models": [],
+    "pricing": []
+  },
+  "error": ""
+}
+```
+
+其中：
+
+- `status`：`missing`、`invalid`、`ready`
+- `config`：当前内存中的 runtime config；`missing` 时通常是空对象
+- `error`：仅在 `invalid` 时有值
+
 runtime config 字段说明：
 
 - `providers[].name`：provider 名称
@@ -142,6 +182,11 @@ runtime config 字段说明：
 - `providers[].base_url`：后端 API 的 base URL，例如 `https://api.deepseek.com/v1` 或 `https://api.anthropic.com/v1`
 - `providers[].api_key`：API Key，支持 `${ENV_NAME}` 环境变量展开
 - `providers[].supported_api_types`：声明 provider 原生支持哪些 API 类型；为空表示默认全支持。当前已用到的值包括 OpenAI 的 `chat_completions`、`responses`，以及 Anthropic 的 `messages`
+- `targets[]`：定义一个具体可调用的后端目标，绑定 `provider + backend_model`
+- `targets[].name`：target 名称，供 `models[]` 引用
+- `targets[].provider`：命中的 provider
+- `targets[].backend_model`：实际转发给后端供应商的模型名
+- `targets[].ignore_request_fields`：命中该 target 时，需要剔除的请求字段
 - `pricing[]`：按 `provider + backend_model` 配置计费单价，用于给 usage 汇总 `estimated_cost_usd`
 - `pricing[].scheme`：计费口径；当前支持 `openai`、`anthropic`、`generic`
 - `pricing[].input_per_1m_tokens`：普通输入 token 单价
@@ -149,12 +194,11 @@ runtime config 字段说明：
 - `pricing[].cache_read_input_per_1m_tokens`：Anthropic prompt cache read 单价
 - `pricing[].cache_creation_input_per_1m_tokens`：Anthropic prompt cache write 单价
 - `pricing[].output_per_1m_tokens`：输出 token 单价
-- `model_routes[].external_model`：对客户端暴露的模型名
-- `model_routes[].targets[]`：按顺序尝试的 provider 目标列表
-- `model_routes[].targets[].provider`：命中的 provider
-- `model_routes[].targets[].backend_model`：实际转发给后端供应商的模型名
+- `models[]`：定义对客户端暴露的模型名，以及按顺序尝试的 target 列表
+- `models[].name`：对客户端暴露的模型名
+- `models[].targets[]`：按顺序尝试的 target 名称列表
 
-当后端返回 `429/500/502/503/504` 或请求直接失败时，网关会自动切到下一个 target。
+当一个 model 配置了多个 target 时，网关按顺序尝试。当前策略是 failover，不做随机、加权或负载均衡。当后端返回 `429/500/502/503/504` 或请求直接失败时，网关会自动切到下一个 target。
 
 passthrough 的判定规则是：
 
@@ -180,6 +224,19 @@ runtime config 示例：
       "type": "openai-compatible",
       "base_url": "https://api.openai.com/v1",
       "api_key": "${OPENAI_API_KEY}"
+    }
+  ],
+  "targets": [
+    {
+      "name": "openai-gpt-5-4",
+      "provider": "openai-prod",
+      "backend_model": "gpt-5.4"
+    }
+  ],
+  "models": [
+    {
+      "name": "gpt-5.4-proxy",
+      "targets": ["openai-gpt-5-4"]
     }
   ],
   "pricing": [
@@ -226,7 +283,7 @@ runtime config 示例：
 1. 为客户端协议实现 adapter
 2. 把请求归一化成内部标准模型
 3. 为不同后端平台实现 provider adapter
-4. 用模型路由决定外部模型名落到哪个 provider target
+4. 用模型配置决定外部模型名落到哪个 provider target
 
 当前仓库已经完成第 2 步骨架，以及第 1 步中的 OpenAI / Anthropic adapter，和第 3 步中的 `openai-compatible` / `anthropic-native` provider。
 
@@ -243,7 +300,7 @@ runtime config 示例：
 创建业务 API Key：
 
 ```bash
-curl http://127.0.0.1:8080/admin/api-keys \
+curl http://127.0.0.1:18080/admin/api-keys \
   -H 'Authorization: Bearer admin-secret' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -258,7 +315,7 @@ curl http://127.0.0.1:8080/admin/api-keys \
 查看业务 API Key 和累计 token / 费用：
 
 ```bash
-curl http://127.0.0.1:8080/admin/api-keys \
+curl http://127.0.0.1:18080/admin/api-keys \
   -H 'Authorization: Bearer admin-secret'
 ```
 
@@ -267,38 +324,44 @@ curl http://127.0.0.1:8080/admin/api-keys \
 查看当前 runtime config：
 
 ```bash
-curl http://127.0.0.1:8080/admin/runtime-config \
+curl http://127.0.0.1:18080/admin/runtime-config \
   -H 'Authorization: Bearer admin-secret'
 ```
 
 更新 runtime config：
 
 ```bash
-curl http://127.0.0.1:8080/admin/runtime-config \
+curl http://127.0.0.1:18080/admin/runtime-config \
   -X PUT \
   -H 'Authorization: Bearer admin-secret' \
   -H 'Content-Type: application/json' \
   --data @runtime-config.json.example
 ```
 
+查看运行就绪状态：
+
+```bash
+curl http://127.0.0.1:18080/readyz
+```
+
 查看所有 API Key 的 token / 费用汇总：
 
 ```bash
-curl http://127.0.0.1:8080/admin/usage \
+curl http://127.0.0.1:18080/admin/usage \
   -H 'Authorization: Bearer admin-secret'
 ```
 
 查看单个 API Key 的 token / 费用：
 
 ```bash
-curl http://127.0.0.1:8080/admin/api-keys/key_xxx/usage \
+curl http://127.0.0.1:18080/admin/api-keys/key_xxx/usage \
   -H 'Authorization: Bearer admin-secret'
 ```
 
 ### OpenAI 风格调用
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl http://127.0.0.1:18080/v1/chat/completions \
   -H 'Authorization: Bearer llmio_xxx' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -312,7 +375,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ### OpenAI Responses 调用
 
 ```bash
-curl http://127.0.0.1:8080/v1/responses \
+curl http://127.0.0.1:18080/v1/responses \
   -H 'Authorization: Bearer llmio_xxx' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -324,7 +387,7 @@ curl http://127.0.0.1:8080/v1/responses \
 ### Anthropic 风格调用
 
 ```bash
-curl http://127.0.0.1:8080/anthropic/v1/messages \
+curl http://127.0.0.1:18080/anthropic/v1/messages \
   -H 'x-api-key: llmio_xxx' \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \
@@ -340,7 +403,7 @@ curl http://127.0.0.1:8080/anthropic/v1/messages \
 ### Anthropic 流式调用
 
 ```bash
-curl http://127.0.0.1:8080/anthropic/v1/messages \
+curl http://127.0.0.1:18080/anthropic/v1/messages \
   -H 'x-api-key: llmio_xxx' \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' \

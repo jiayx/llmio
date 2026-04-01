@@ -10,16 +10,14 @@ import (
 )
 
 func TestRouterResolveAndModelInfos(t *testing.T) {
-	router, err := New(&config.Config{
-		ModelRoutes: []config.ModelRoute{
-			{
-				ExternalModel: "b-model",
-				Targets:       []config.Target{{Provider: "p1", BackendModel: "backend-b"}},
-			},
-			{
-				ExternalModel: "a-model",
-				Targets:       []config.Target{{Provider: "p2", BackendModel: "backend-a", IgnoreRequestFields: []string{"temperature"}}},
-			},
+	router, err := New(&config.RuntimeConfig{
+		Targets: []config.TargetConfig{
+			{Name: "b-target", Provider: "p1", BackendModel: "backend-b"},
+			{Name: "a-target", Provider: "p2", BackendModel: "backend-a", IgnoreRequestFields: []string{"temperature"}},
+		},
+		Models: []config.ModelConfig{
+			{Name: "b-model", Targets: []string{"b-target"}},
+			{Name: "a-model", Targets: []string{"a-target"}},
 		},
 	}, map[string]providerapi.ProviderAdapter{
 		"p1": routingStubProvider{},

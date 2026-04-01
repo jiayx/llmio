@@ -21,6 +21,23 @@
       "api_key": "${ANTHROPIC_API_KEY}"
     }
   ],
+  "targets": [
+    {
+      "name": "moonshot-8k",
+      "provider": "moonshot",
+      "backend_model": "moonshot-v1-8k"
+    },
+    {
+      "name": "deepseek-chat",
+      "provider": "deepseek",
+      "backend_model": "deepseek-chat"
+    },
+    {
+      "name": "claude-3-5-sonnet",
+      "provider": "anthropic",
+      "backend_model": "claude-3-5-sonnet-20241022"
+    }
+  ],
   "pricing": [
     {
       "provider": "moonshot",
@@ -48,36 +65,14 @@
       "output_per_1m_tokens": 15
     }
   ],
-  "model_routes": [
+  "models": [
     {
-      "external_model": "gpt-4o-proxy",
-      "targets": [
-        {
-          "provider": "moonshot",
-          "backend_model": "moonshot-v1-8k"
-        },
-        {
-          "provider": "deepseek",
-          "backend_model": "deepseek-chat"
-        }
-      ]
+      "name": "gpt-4o-proxy",
+      "targets": ["moonshot-8k", "deepseek-chat"]
     },
     {
-      "external_model": "claude-3-5-sonnet-proxy",
-      "targets": [
-        {
-          "provider": "anthropic",
-          "backend_model": "claude-3-5-sonnet-20241022"
-        },
-        {
-          "provider": "deepseek",
-          "backend_model": "deepseek-chat"
-        },
-        {
-          "provider": "moonshot",
-          "backend_model": "moonshot-v1-8k"
-        }
-      ]
+      "name": "claude-3-5-sonnet-proxy",
+      "targets": ["claude-3-5-sonnet", "deepseek-chat", "moonshot-8k"]
     }
   ]
 }

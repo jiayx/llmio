@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jiayx/llmio/internal/apikeys"
+	"github.com/jiayx/llmio/internal/authctx"
 	"github.com/jiayx/llmio/internal/billing"
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/llm"
@@ -22,7 +23,7 @@ import (
 	openaiproto "github.com/jiayx/llmio/internal/protocols/openai"
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
-	"github.com/jiayx/llmio/internal/usage"
+	storagesqlite "github.com/jiayx/llmio/internal/storage/sqlite"
 )
 
 func TestAnthropicToLLM(t *testing.T) {
@@ -85,7 +86,12 @@ func TestLLMResponseToAnthropic(t *testing.T) {
 }
 
 func TestWithAuth(t *testing.T) {
-	s := &Server{adminAPIKeys: map[string]apikeys.Principal{"secret": {ID: "admin:secret", Name: "admin"}}}
+	db := mustTestDB(t)
+	s := &Server{
+		adminAPIKeys: map[string]authctx.Principal{"secret": {ID: "admin:secret", Name: "admin"}},
+		apiKeyStore:  storagesqlite.NewAPIKeyStore(db),
+		runtimeStore: storagesqlite.NewRuntimeConfigStore(db),
+	}
 	handler := s.withAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -107,10 +113,8 @@ func TestWithAuth(t *testing.T) {
 }
 
 func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
-	store, err := apikeys.Open(filepath.Join(t.TempDir(), "apikeys.json"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
+	db := mustTestDB(t)
+	store := storagesqlite.NewAPIKeyStore(db)
 
 	providersMap := map[string]chatProvider{
 		"primary": fakeProvider{chatResp: &llm.ChatResponse{
@@ -123,18 +127,20 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 			OutputTokens:         7,
 		}},
 	}
-	router, err := routing.New(&config.Config{
+	router, err := routing.New(&config.RuntimeConfig{
 		Providers: []config.ProviderConfig{{
 			Name:    "primary",
 			Type:    "openai-compatible",
 			BaseURL: "https://example.com/v1",
 		}},
-		ModelRoutes: []config.ModelRoute{{
-			ExternalModel: "gpt-proxy",
-			Targets: []config.Target{{
-				Provider:     "primary",
-				BackendModel: "backend-model",
-			}},
+		Targets: []config.TargetConfig{{
+			Name:         "primary-backend-model",
+			Provider:     "primary",
+			BackendModel: "backend-model",
+		}},
+		Models: []config.ModelConfig{{
+			Name:    "gpt-proxy",
+			Targets: []string{"primary-backend-model"},
 		}},
 	}, providersMap)
 	if err != nil {
@@ -152,10 +158,10 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 				CachedInputPer1MTokens: 0.25,
 				OutputPer1MTokens:      15,
 			}}),
-			Next: usage.SQLiteRecorder{DB: store.DB()},
+			Next: storagesqlite.NewUsageStore(db),
 		}),
 	})
-	s.adminAPIKeys = map[string]apikeys.Principal{
+	s.adminAPIKeys = map[string]authctx.Principal{
 		"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
 	}
 	s.apiKeyStore = store
@@ -205,7 +211,7 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 		t.Fatalf("get status = %d body=%s", getRec.Code, getRec.Body.String())
 	}
 
-	var key apikeys.KeySummary
+	var key storagesqlite.KeySummary
 	if err := json.Unmarshal(getRec.Body.Bytes(), &key); err != nil {
 		t.Fatalf("unmarshal get = %v", err)
 	}
@@ -236,7 +242,7 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 		t.Fatalf("usage status = %d body=%s", usageRec.Code, usageRec.Body.String())
 	}
 
-	var singleUsage apikeys.UsageReport
+	var singleUsage storagesqlite.UsageReport
 	if err := json.Unmarshal(usageRec.Body.Bytes(), &singleUsage); err != nil {
 		t.Fatalf("unmarshal usage = %v", err)
 	}
@@ -262,8 +268,8 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 	}
 
 	var usageList struct {
-		Total apikeys.UsageTotals   `json:"total"`
-		Data  []apikeys.UsageReport `json:"data"`
+		Total storagesqlite.UsageTotals   `json:"total"`
+		Data  []storagesqlite.UsageReport `json:"data"`
 	}
 	if err := json.Unmarshal(adminUsageRec.Body.Bytes(), &usageList); err != nil {
 		t.Fatalf("unmarshal usage list = %v", err)
@@ -283,10 +289,8 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 }
 
 func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
-	store, err := apikeys.Open(filepath.Join(t.TempDir(), "apikeys.json"))
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
+	db := mustTestDB(t)
+	store := storagesqlite.NewAPIKeyStore(db)
 
 	providersMap := map[string]chatProvider{
 		"primary": fakeProvider{chatResp: &llm.ChatResponse{
@@ -297,18 +301,20 @@ func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
 			OutputTokens: 1000,
 		}},
 	}
-	router, err := routing.New(&config.Config{
+	router, err := routing.New(&config.RuntimeConfig{
 		Providers: []config.ProviderConfig{{
 			Name:    "primary",
 			Type:    "openai-compatible",
 			BaseURL: "https://example.com/v1",
 		}},
-		ModelRoutes: []config.ModelRoute{{
-			ExternalModel: "gpt-proxy",
-			Targets: []config.Target{{
-				Provider:     "primary",
-				BackendModel: "backend-model",
-			}},
+		Targets: []config.TargetConfig{{
+			Name:         "primary-backend-model",
+			Provider:     "primary",
+			BackendModel: "backend-model",
+		}},
+		Models: []config.ModelConfig{{
+			Name:    "gpt-proxy",
+			Targets: []string{"primary-backend-model"},
 		}},
 	}, providersMap)
 	if err != nil {
@@ -325,10 +331,10 @@ func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
 				InputPer1MTokens:  1000,
 				OutputPer1MTokens: 1000,
 			}}),
-			Next: usage.SQLiteRecorder{DB: store.DB()},
+			Next: storagesqlite.NewUsageStore(db),
 		}),
 	})
-	s.adminAPIKeys = map[string]apikeys.Principal{
+	s.adminAPIKeys = map[string]authctx.Principal{
 		"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
 	}
 	s.apiKeyStore = store
@@ -371,34 +377,16 @@ func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
 
 func TestAdminRuntimeConfigHotReload(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "llmio.db")
-	s, err := NewServer(&config.Config{
+	db := mustDBAtPath(t, dbPath)
+	s, err := NewServer(&config.AppConfig{
 		DatabasePath: dbPath,
 		AdminAPIKeys: []string{"admin-secret"},
-		Providers:    nil,
-		ModelRoutes:  nil,
-		Pricing:      nil,
-	})
+	}, MissingRuntimeConfigState(), db)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
 
 	handler := s.Handler()
-
-	getReq := httptest.NewRequest(http.MethodGet, "/admin/runtime-config", nil)
-	getReq.Header.Set("Authorization", "Bearer admin-secret")
-	getRec := httptest.NewRecorder()
-	handler.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("initial get status = %d body=%s", getRec.Code, getRec.Body.String())
-	}
-
-	var initial config.RuntimeConfig
-	if err := json.Unmarshal(getRec.Body.Bytes(), &initial); err != nil {
-		t.Fatalf("unmarshal initial runtime config = %v", err)
-	}
-	if len(initial.Providers) != 0 || len(initial.ModelRoutes) != 0 || len(initial.Pricing) != 0 {
-		t.Fatalf("initial runtime config = %#v", initial)
-	}
 
 	body := `{
 		"providers":[
@@ -408,15 +396,17 @@ func TestAdminRuntimeConfigHotReload(t *testing.T) {
 				"base_url":"https://example.com/v1"
 			}
 		],
-		"model_routes":[
+		"targets":[
 			{
-				"external_model":"gpt-proxy",
-				"targets":[
-					{
-						"provider":"primary",
-						"backend_model":"backend-model"
-					}
-				]
+				"name":"primary-backend-model",
+				"provider":"primary",
+				"backend_model":"backend-model"
+			}
+		],
+		"models":[
+			{
+				"name":"gpt-proxy",
+				"targets":["primary-backend-model"]
 			}
 		],
 		"pricing":[
@@ -439,11 +429,18 @@ func TestAdminRuntimeConfigHotReload(t *testing.T) {
 		t.Fatalf("put status = %d body=%s", putRec.Code, putRec.Body.String())
 	}
 
-	var updated config.RuntimeConfig
+	var updated struct {
+		Status string               `json:"status"`
+		Config config.RuntimeConfig `json:"config"`
+		Error  string               `json:"error"`
+	}
 	if err := json.Unmarshal(putRec.Body.Bytes(), &updated); err != nil {
 		t.Fatalf("unmarshal updated runtime config = %v", err)
 	}
-	if len(updated.Providers) != 1 || len(updated.ModelRoutes) != 1 || len(updated.Pricing) != 1 {
+	if updated.Status != string(RuntimeConfigStatusReady) {
+		t.Fatalf("updated status = %#v", updated)
+	}
+	if len(updated.Config.Providers) != 1 || len(updated.Config.Targets) != 1 || len(updated.Config.Models) != 1 || len(updated.Config.Pricing) != 1 {
 		t.Fatalf("updated runtime config = %#v", updated)
 	}
 
@@ -468,20 +465,73 @@ func TestAdminRuntimeConfigHotReload(t *testing.T) {
 		t.Fatalf("reload get status = %d body=%s", reloadRec.Code, reloadRec.Body.String())
 	}
 
-	var persisted config.RuntimeConfig
+	var persisted struct {
+		Status string               `json:"status"`
+		Config config.RuntimeConfig `json:"config"`
+		Error  string               `json:"error"`
+	}
 	if err := json.Unmarshal(reloadRec.Body.Bytes(), &persisted); err != nil {
 		t.Fatalf("unmarshal persisted runtime config = %v", err)
 	}
-	if len(persisted.Providers) != 1 || persisted.Providers[0].Name != "primary" {
+	if persisted.Status != string(RuntimeConfigStatusReady) {
+		t.Fatalf("persisted status = %#v", persisted)
+	}
+	if len(persisted.Config.Providers) != 1 || persisted.Config.Providers[0].Name != "primary" {
 		t.Fatalf("persisted runtime config = %#v", persisted)
 	}
 }
 
-func TestDisabledManagedAPIKeyCannotCallLLM(t *testing.T) {
-	store, err := apikeys.Open(filepath.Join(t.TempDir(), "apikeys.json"))
+func TestMissingRuntimeConfigState(t *testing.T) {
+	db := mustTestDB(t)
+	s, err := NewServer(&config.AppConfig{
+		AdminAPIKeys: []string{"admin-secret"},
+	}, MissingRuntimeConfigState(), db)
 	if err != nil {
-		t.Fatalf("Open() error = %v", err)
+		t.Fatalf("NewServer() error = %v", err)
 	}
+
+	readyReq := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	readyRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(readyRec, readyReq)
+	if readyRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ready status = %d body=%s", readyRec.Code, readyRec.Body.String())
+	}
+
+	adminReq := httptest.NewRequest(http.MethodGet, "/admin/runtime-config", nil)
+	adminReq.Header.Set("Authorization", "Bearer admin-secret")
+	adminRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(adminRec, adminReq)
+	if adminRec.Code != http.StatusOK {
+		t.Fatalf("admin status = %d body=%s", adminRec.Code, adminRec.Body.String())
+	}
+	var state struct {
+		Status string               `json:"status"`
+		Config config.RuntimeConfig `json:"config"`
+		Error  string               `json:"error"`
+	}
+	if err := json.Unmarshal(adminRec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("unmarshal state = %v", err)
+	}
+	if state.Status != string(RuntimeConfigStatusMissing) {
+		t.Fatalf("state = %#v", state)
+	}
+
+	key, err := s.apiKeyStore.Create("worker", nil)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+key.Secret)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDisabledManagedAPIKeyCannotCallLLM(t *testing.T) {
+	store := storagesqlite.NewAPIKeyStore(mustTestDB(t))
+	var err error
 	created, err := store.Create("worker", nil)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -878,7 +928,8 @@ func TestOpenAIRequestToLLMToolCalls(t *testing.T) {
 }
 
 func TestNewServerAnthropicNativeProvider(t *testing.T) {
-	server, err := NewServer(&config.Config{
+	db := mustTestDB(t)
+	server, err := NewServer(&config.AppConfig{}, ReadyRuntimeConfigState(config.RuntimeConfig{
 		Providers: []config.ProviderConfig{
 			{
 				Name:    "anthropic",
@@ -887,15 +938,13 @@ func TestNewServerAnthropicNativeProvider(t *testing.T) {
 				APIKey:  "secret",
 			},
 		},
-		ModelRoutes: []config.ModelRoute{
-			{
-				ExternalModel: "claude-proxy",
-				Targets: []config.Target{
-					{Provider: "anthropic", BackendModel: "claude-3-7-sonnet"},
-				},
-			},
+		Targets: []config.TargetConfig{
+			{Name: "anthropic-sonnet", Provider: "anthropic", BackendModel: "claude-3-7-sonnet"},
 		},
-	})
+		Models: []config.ModelConfig{
+			{Name: "claude-proxy", Targets: []string{"anthropic-sonnet"}},
+		},
+	}), db)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
@@ -1249,6 +1298,9 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 		router: mustTestRouter(t, providersMap, "claude-proxy", "p", "x"),
 		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
+	s.adminAPIKeys = map[string]authctx.Principal{
+		"admin-secret": {ID: "admin:admin-secret", Name: "admin"},
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{
 		"model":"claude-proxy",
@@ -1256,6 +1308,7 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 		"stream":true,
 		"messages":[{"role":"user","content":"hello"}]
 	}`))
+	req.Header.Set("Authorization", "Bearer admin-secret")
 	rec := httptest.NewRecorder()
 
 	s.Handler().ServeHTTP(rec, req)
@@ -1395,13 +1448,15 @@ func (f *fakePassthroughProvider) Forward(ctx context.Context, protocol, path st
 func mustTestRouter(t *testing.T, providers map[string]chatProvider, externalModel, providerName, backendModel string) *routing.Router {
 	t.Helper()
 
-	router, err := routing.New(&config.Config{
-		ModelRoutes: []config.ModelRoute{{
-			ExternalModel: externalModel,
-			Targets: []config.Target{{
-				Provider:     providerName,
-				BackendModel: backendModel,
-			}},
+	router, err := routing.New(&config.RuntimeConfig{
+		Targets: []config.TargetConfig{{
+			Name:         providerName + "-" + backendModel,
+			Provider:     providerName,
+			BackendModel: backendModel,
+		}},
+		Models: []config.ModelConfig{{
+			Name:    externalModel,
+			Targets: []string{providerName + "-" + backendModel},
 		}},
 	}, providers)
 	if err != nil {
@@ -1410,9 +1465,39 @@ func mustTestRouter(t *testing.T, providers map[string]chatProvider, externalMod
 	return router
 }
 
+func mustTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	return mustDBAtPath(t, filepath.Join(t.TempDir(), "llmio.db"))
+}
+
+func mustDBAtPath(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := storagesqlite.Open(path)
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
+	if err := storagesqlite.Init(db); err != nil {
+		t.Fatalf("sqlite.Init() error = %v", err)
+	}
+	return db
+}
+
 func newTestServerWithSnapshot(snapshot runtimeSnapshot) *Server {
+	db, err := storagesqlite.Open("")
+	if err != nil {
+		panic(err)
+	}
+	if err := storagesqlite.Init(db); err != nil {
+		panic(err)
+	}
 	s := &Server{
+		apiKeyStore:      storagesqlite.NewAPIKeyStore(db),
+		runtimeStore:     storagesqlite.NewRuntimeConfigStore(db),
+		db:               db,
 		protocolAdapters: protocols.DefaultAdapters(),
+	}
+	if snapshot.status == "" {
+		snapshot.status = RuntimeConfigStatusReady
 	}
 	s.snapshot.Store(&snapshot)
 	return s
