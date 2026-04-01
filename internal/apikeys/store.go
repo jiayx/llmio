@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jiayx/llmio/internal/usage"
 	_ "modernc.org/sqlite"
 )
 
@@ -459,28 +458,12 @@ func (s *Store) UsageReports() ([]UsageReport, UsageTotals) {
 	return out, total
 }
 
-// Record stores usage under the authenticated managed API key.
-func (s *Store) Record(_ context.Context, event usage.Event) {
-	if event.APIKeyID == "" {
-		return
+// DB exposes the shared SQLite handle for related stores such as usage recorders.
+func (s *Store) DB() *sql.DB {
+	if s == nil {
+		return nil
 	}
-
-	lastUsedAt := event.Timestamp.UTC().Format(time.RFC3339Nano)
-	_, _ = s.db.Exec(`
-		UPDATE api_key_usage
-		SET
-			request_count = request_count + 1,
-			priced_request_count = priced_request_count + ?,
-			input_tokens = input_tokens + ?,
-			cached_input_tokens = cached_input_tokens + ?,
-			cache_read_input_tokens = cache_read_input_tokens + ?,
-			cache_creation_input_tokens = cache_creation_input_tokens + ?,
-			output_tokens = output_tokens + ?,
-			total_tokens = total_tokens + ?,
-			estimated_cost_usd = estimated_cost_usd + ?,
-			last_used_at = ?
-		WHERE api_key_id = ?
-	`, boolToInt(event.CostKnown), event.InputTokens, event.CachedInputTokens, event.CacheReadInputTokens, event.CacheCreationInputTokens, event.OutputTokens, event.TotalTokens, event.EstimatedCostUSD, lastUsedAt, event.APIKeyID)
+	return s.db
 }
 
 func scanKeySummary(scanner interface {

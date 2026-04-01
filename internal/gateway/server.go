@@ -25,6 +25,7 @@ import (
 	providerapi "github.com/jiayx/llmio/internal/providers/api"
 	"github.com/jiayx/llmio/internal/routing"
 	"github.com/jiayx/llmio/internal/runtimeconfig"
+	"github.com/jiayx/llmio/internal/usage"
 )
 
 type chatProvider = providerapi.ProviderAdapter
@@ -681,7 +682,7 @@ func (s *Server) buildRuntimeSnapshot(doc config.RuntimeConfig) (*runtimeSnapsho
 
 	execPolicy := policy.NewWithRecorder(policy.DefaultConfig(), providersMap, billing.PricingRecorder{
 		Catalog: billing.NewCatalog(doc.Pricing),
-		Next:    s.apiKeyStore,
+		Next:    usage.SQLiteRecorder{DB: s.apiKeyStore.DB()},
 	})
 	return &runtimeSnapshot{
 		router: router,

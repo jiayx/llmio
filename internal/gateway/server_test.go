@@ -152,7 +152,7 @@ func TestManagedAPIKeyLifecycleAndUsage(t *testing.T) {
 				CachedInputPer1MTokens: 0.25,
 				OutputPer1MTokens:      15,
 			}}),
-			Next: usage.MultiRecorder{store},
+			Next: usage.SQLiteRecorder{DB: store.DB()},
 		}),
 	})
 	s.adminAPIKeys = map[string]apikeys.Principal{
@@ -325,7 +325,7 @@ func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
 				InputPer1MTokens:  1000,
 				OutputPer1MTokens: 1000,
 			}}),
-			Next: usage.MultiRecorder{store},
+			Next: usage.SQLiteRecorder{DB: store.DB()},
 		}),
 	})
 	s.adminAPIKeys = map[string]apikeys.Principal{
@@ -372,11 +372,11 @@ func TestManagedAPIKeyBudgetExceeded(t *testing.T) {
 func TestAdminRuntimeConfigHotReload(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "llmio.db")
 	s, err := NewServer(&config.Config{
-		DatabasePath:  dbPath,
-		AdminAPIKeys:  []string{"admin-secret"},
-		Providers:     nil,
-		ModelRoutes:   nil,
-		Pricing:       nil,
+		DatabasePath: dbPath,
+		AdminAPIKeys: []string{"admin-secret"},
+		Providers:    nil,
+		ModelRoutes:  nil,
+		Pricing:      nil,
 	})
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
@@ -763,7 +763,7 @@ func TestHandleOpenAIResponses(t *testing.T) {
 	}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
 		router: mustTestRouter(t, providersMap, "gpt-proxy", "primary", "backend-model"),
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
@@ -918,7 +918,7 @@ func TestHandleOpenAIChatCompletionsPassthrough(t *testing.T) {
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
 		router: mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-proxy","messages":[{"role":"user","content":"hello"}]}`))
@@ -956,7 +956,7 @@ func TestHandleOpenAIResponsesPassthrough(t *testing.T) {
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
 		router: mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-proxy","input":"hello"}`))
@@ -986,7 +986,7 @@ func TestHandleOpenAIResponsesFallsBackWhenAPITypeUnsupported(t *testing.T) {
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
 		router: mustTestRouter(t, providersMap, "gpt-proxy", "p", "backend-model"),
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-proxy","input":"hello"}`))
@@ -1051,7 +1051,7 @@ func TestHandleAnthropicMessagesPassthrough(t *testing.T) {
 	providersMap := map[string]chatProvider{"p": p}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
 		router: mustTestRouter(t, providersMap, "claude-proxy", "p", "backend-model"),
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"claude-proxy","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`))
@@ -1247,7 +1247,7 @@ func TestHandlerAnthropicStreamWithLoggingWrapper(t *testing.T) {
 	providersMap := map[string]chatProvider{"p": fakeProvider{stream: stream}}
 	s := newTestServerWithSnapshot(runtimeSnapshot{
 		router: mustTestRouter(t, providersMap, "claude-proxy", "p", "x"),
-		policy:    policy.New(policy.DefaultConfig(), providersMap),
+		policy: policy.New(policy.DefaultConfig(), providersMap),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{
