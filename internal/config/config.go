@@ -14,6 +14,22 @@ type AppConfig struct {
 	DatabasePath string   `json:"database_path"`
 }
 
+// LoadAppConfig resolves process startup config from environment.
+func LoadAppConfig() (*AppConfig, error) {
+	cfg := &AppConfig{
+		Listen:       strings.TrimSpace(os.Getenv("LLMIO_LISTEN")),
+		AdminAPIKeys: splitCSV(os.Getenv("LLMIO_ADMIN_API_KEYS")),
+		DatabasePath: strings.TrimSpace(os.Getenv("LLMIO_DATABASE_PATH")),
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = ":18080"
+	}
+	if cfg.DatabasePath == "" {
+		return nil, fmt.Errorf("LLMIO_DATABASE_PATH is required")
+	}
+	return cfg, nil
+}
+
 type RuntimeConfig struct {
 	Providers []ProviderConfig `json:"providers"`
 	Targets   []TargetConfig   `json:"targets,omitempty"`
@@ -272,6 +288,23 @@ func parseEnvReference(value string) (string, bool) {
 // LoadEnv loads the process .env file before any other config resolution.
 func LoadEnv() error {
 	return loadDotEnv(".env")
+}
+
+func splitCSV(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
 }
 
 func loadDotEnv(path string) error {

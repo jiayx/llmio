@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/jiayx/llmio/internal/config"
 	"github.com/jiayx/llmio/internal/gateway"
@@ -18,17 +17,15 @@ type Application struct {
 }
 
 // Bootstrap loads runtime config from SQLite and assembles the gateway service graph.
-func Bootstrap(databasePath string) (*Application, error) {
-	databasePath = strings.TrimSpace(databasePath)
-	if databasePath == "" {
-		databasePath = os.Getenv("LLMIO_DATABASE_PATH")
+func Bootstrap(appCfg *config.AppConfig) (*Application, error) {
+	if appCfg == nil {
+		return nil, errors.New("app config is required")
 	}
-	databasePath = strings.TrimSpace(databasePath)
-	if databasePath == "" {
-		databasePath = "llmio.db"
+	if appCfg.DatabasePath == "" {
+		return nil, errors.New("database path is required")
 	}
 
-	db, err := storagesqlite.Open(databasePath)
+	db, err := storagesqlite.Open(appCfg.DatabasePath)
 	if err != nil {
 		return nil, err
 	}
@@ -55,14 +52,6 @@ func Bootstrap(databasePath string) (*Application, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	appCfg := &config.AppConfig{
-		Listen:       strings.TrimSpace(os.Getenv("LLMIO_LISTEN")),
-		AdminAPIKeys: splitCSV(os.Getenv("LLMIO_ADMIN_API_KEYS")),
-		DatabasePath: databasePath,
-	}
-	if appCfg.Listen == "" {
-		appCfg.Listen = ":18080"
-	}
 	server, err := gateway.NewServer(appCfg, runtimeState, db)
 	if err != nil {
 		_ = db.Close()
@@ -73,23 +62,6 @@ func Bootstrap(databasePath string) (*Application, error) {
 		Config:  appCfg,
 		Gateway: server,
 	}, nil
-}
-
-func splitCSV(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		out = append(out, part)
-	}
-	return out
 }
 
 // Handler returns the root HTTP handler for the application.

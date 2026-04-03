@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -167,5 +168,36 @@ func TestLoadEnvReadsDotEnvFromWorkingDirectory(t *testing.T) {
 	}
 	if got := os.Getenv("LLMIO_LOG_LEVEL"); got != "debug" {
 		t.Fatalf("LLMIO_LOG_LEVEL = %q", got)
+	}
+}
+
+func TestLoadAppConfigRequiresDatabasePath(t *testing.T) {
+	t.Setenv("LLMIO_DATABASE_PATH", "")
+	t.Setenv("LLMIO_LISTEN", "")
+	t.Setenv("LLMIO_ADMIN_API_KEYS", "")
+
+	_, err := LoadAppConfig()
+	if err == nil || !strings.Contains(err.Error(), "LLMIO_DATABASE_PATH is required") {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+}
+
+func TestLoadAppConfigReadsStartupConfigFromEnv(t *testing.T) {
+	t.Setenv("LLMIO_DATABASE_PATH", "/var/lib/llmio/llmio.db")
+	t.Setenv("LLMIO_LISTEN", ":19090")
+	t.Setenv("LLMIO_ADMIN_API_KEYS", "a, b")
+
+	cfg, err := LoadAppConfig()
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+	if cfg.DatabasePath != "/var/lib/llmio/llmio.db" {
+		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
+	}
+	if cfg.Listen != ":19090" {
+		t.Fatalf("Listen = %q", cfg.Listen)
+	}
+	if len(cfg.AdminAPIKeys) != 2 || cfg.AdminAPIKeys[0] != "a" || cfg.AdminAPIKeys[1] != "b" {
+		t.Fatalf("AdminAPIKeys = %#v", cfg.AdminAPIKeys)
 	}
 }
